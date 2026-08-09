@@ -1,6 +1,8 @@
 /target/
 /.run/
 /.idea/
+/docs/plans/
+/docs/specs/*-design.md
 .env
 *.pid
 .DS_Store
