@@ -1,0 +1,5 @@
+/target/
+/.run/
+.env
+*.pid
+.DS_Store
