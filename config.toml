@@ -1,0 +1,29 @@
+bind_addr = "127.0.0.1:8787"
+exchange_log_dir = ".run/exchanges"
+
+[[providers]]
+name = "ada"
+base_url = "http://ada-cli-golang.ctripcorp.com/coding-plan/openai/v1"
+api_key_env = "ADA_API_KEY"
+supports_compact = false
+
+[[providers.models]]
+public_model = "gpt-5.6-luna"
+upstream_model = "DeepSeek-V4-Flash-0731"
+response_adapter = "deepseek"
+
+[[providers.models]]
+public_model = "gpt-5.6-terra"
+upstream_model = "DeepSeek-V4-Pro-discount"
+response_adapter = "deepseek"
+
+[[providers]]
+name = "ada-standard"
+base_url = "http://ada-cli-golang.ctripcorp.com/coding-plan/openai/v1"
+api_key_env = "ADA_API_KEY"
+supports_compact = true
+
+[[providers.models]]
+public_model = "gpt-5.6-sol"
+upstream_model = "glm-5.2-discount"
+response_adapter = "standard"

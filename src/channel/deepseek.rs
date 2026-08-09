@@ -5,6 +5,7 @@ pub struct DeepSeekChannel;
 
 impl UpstreamChannel for DeepSeekChannel {
     fn normalize_request(&self, body: &mut Value) {
+        promote_additional_tools(body);
         // Ada DeepSeek session state is unreliable; Codex also defaults to store=false.
         if body.get("store").is_some() {
             body["store"] = Value::Bool(false);
@@ -15,10 +16,7 @@ impl UpstreamChannel for DeepSeekChannel {
         }
         match body.get_mut("reasoning") {
             Some(Value::Object(reasoning)) => {
-                reasoning.insert(
-                    "effort".to_string(),
-                    Value::String("none".to_string()),
-                );
+                reasoning.insert("effort".to_string(), Value::String("none".to_string()));
             }
             _ => {
                 body["reasoning"] = serde_json::json!({ "effort": "none" });
@@ -31,20 +29,76 @@ impl UpstreamChannel for DeepSeekChannel {
     }
 }
 
-fn strip_unsupported_include(body: &mut Value) {
-    let Some(include) = body.get_mut("include").and_then(|include| include.as_array_mut()) else {
+fn promote_additional_tools(body: &mut Value) {
+    let already_has_tools = has_tools(body);
+    let Some(input) = body.get_mut("input").and_then(|input| input.as_array_mut()) else {
         return;
     };
-    include.retain(|item| {
-        item.as_str()
-            .is_none_or(|value| value != "reasoning.encrypted_content")
-    });
+
+    let mut promoted = Vec::new();
+    let mut kept = Vec::new();
+    for item in input.drain(..) {
+        let is_additional_tools =
+            item.get("type").and_then(|value| value.as_str()) == Some("additional_tools");
+        if !is_additional_tools {
+            kept.push(item);
+            continue;
+        }
+        promoted.extend(tools_from_additional_tools_item(&item));
+    }
+    *input = kept;
+
+    if already_has_tools || promoted.is_empty() {
+        return;
+    }
+    body["tools"] = Value::Array(promoted);
+}
+
+fn tools_from_additional_tools_item(item: &Value) -> Vec<Value> {
+    let Some(entries) = item.get("tools").and_then(|tools| tools.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut promoted = Vec::new();
+    for entry in entries {
+        match entry.get("type").and_then(|value| value.as_str()) {
+            Some("namespace") => {
+                for tool in entry
+                    .get("tools")
+                    .and_then(|tools| tools.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    promoted.push(tool.clone());
+                }
+            }
+            // Codex Desktop: flat function/custom tools under additional_tools.tools[]
+            Some(_) if entry.get("name").and_then(|value| value.as_str()).is_some() => {
+                promoted.push(entry.clone());
+            }
+            _ => {}
+        }
+    }
+    promoted
 }
 
 fn has_tools(body: &Value) -> bool {
     body.get("tools")
         .and_then(|tools| tools.as_array())
         .is_some_and(|tools| !tools.is_empty())
+}
+
+fn strip_unsupported_include(body: &mut Value) {
+    let Some(include) = body
+        .get_mut("include")
+        .and_then(|include| include.as_array_mut())
+    else {
+        return;
+    };
+    include.retain(|item| {
+        item.as_str()
+            .is_none_or(|value| value != "reasoning.encrypted_content")
+    });
 }
 
 fn has_forced_tool_choice(body: &Value) -> bool {
@@ -66,7 +120,10 @@ fn strip_tool_call_reasoning_content(body: &mut Value) {
 }
 
 fn strip_reasoning_content_from_output(value: &mut Value) {
-    let Some(output) = value.get_mut("output").and_then(|output| output.as_array_mut()) else {
+    let Some(output) = value
+        .get_mut("output")
+        .and_then(|output| output.as_array_mut())
+    else {
         return;
     };
     for item in output {
