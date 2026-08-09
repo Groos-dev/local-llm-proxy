@@ -520,6 +520,7 @@ fn raw_response<B: Into<Body>>(
             .headers_mut()
             .insert(HeaderName::from_static("openai-model"), value);
     }
+    // TODO 这些header 一定会有吗，回写有什么作用, 影响codex工作吗
     for name in [
         "request-id",
         "x-request-id",
