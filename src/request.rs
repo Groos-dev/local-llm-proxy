@@ -2,83 +2,34 @@ use crate::model::ModelRoute;
 use serde_json::Value;
 
 /// Codex-facing request prep, then upstream-channel-specific adaptations.
-pub fn normalize_request_for_upstream(route: ModelRoute, body: &mut Value) {
-    // Codex client quirk (all channels): tools often arrive as additional_tools.
-    promote_additional_tools(body);
+pub fn normalize_request_for_upstream(route: &ModelRoute, body: &mut Value) {
     route.channel.normalize_request(body);
-}
-
-fn promote_additional_tools(body: &mut Value) {
-    let already_has_tools = has_tools(body);
-    let Some(input) = body.get_mut("input").and_then(|input| input.as_array_mut()) else {
-        return;
-    };
-
-    let mut promoted = Vec::new();
-    let mut kept = Vec::new();
-    for item in input.drain(..) {
-        let is_additional_tools = item.get("type").and_then(|value| value.as_str())
-            == Some("additional_tools");
-        if !is_additional_tools {
-            kept.push(item);
-            continue;
-        }
-        promoted.extend(tools_from_additional_tools_item(&item));
-    }
-    *input = kept;
-
-    if already_has_tools || promoted.is_empty() {
-        return;
-    }
-    body["tools"] = Value::Array(promoted);
-}
-
-fn tools_from_additional_tools_item(item: &Value) -> Vec<Value> {
-    let Some(entries) = item.get("tools").and_then(|tools| tools.as_array()) else {
-        return Vec::new();
-    };
-
-    let mut promoted = Vec::new();
-    for entry in entries {
-        match entry.get("type").and_then(|value| value.as_str()) {
-            Some("namespace") => {
-                for tool in entry
-                    .get("tools")
-                    .and_then(|tools| tools.as_array())
-                    .into_iter()
-                    .flatten()
-                {
-                    promoted.push(tool.clone());
-                }
-            }
-            // Codex Desktop: flat function/custom tools under additional_tools.tools[]
-            Some(_) if entry.get("name").and_then(|value| value.as_str()).is_some() => {
-                promoted.push(entry.clone());
-            }
-            _ => {}
-        }
-    }
-    promoted
-}
-
-fn has_tools(body: &Value) -> bool {
-    body.get("tools")
-        .and_then(|tools| tools.as_array())
-        .is_some_and(|tools| !tools.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::route_for_public_model;
+    use crate::channel::ChannelKind;
     use serde_json::json;
 
+    fn route(channel: ChannelKind) -> ModelRoute {
+        ModelRoute {
+            origin_model: "upstream-model".to_string(),
+            public_model: "public-model".to_string(),
+            provider_name: "provider".to_string(),
+            upstream_base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            channel,
+            supports_compact: false,
+        }
+    }
+
     fn deepseek() -> ModelRoute {
-        route_for_public_model("gpt-5.6-luna").unwrap()
+        route(ChannelKind::DeepSeek)
     }
 
     fn standard() -> ModelRoute {
-        route_for_public_model("gpt-5.6-sol").unwrap()
+        route(ChannelKind::Standard)
     }
 
     #[test]
@@ -90,7 +41,7 @@ mod tests {
             "reasoning": {"effort": "high", "summary": "detailed"}
         });
 
-        normalize_request_for_upstream(deepseek(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["reasoning"]["effort"], "none");
         assert_eq!(request["reasoning"]["summary"], "detailed");
@@ -103,7 +54,7 @@ mod tests {
             "tool_choice": {"type": "custom", "name": "shell"}
         });
 
-        normalize_request_for_upstream(deepseek(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["reasoning"]["effort"], "none");
     }
@@ -116,7 +67,7 @@ mod tests {
             "reasoning": {"effort": "high"}
         });
 
-        normalize_request_for_upstream(deepseek(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["reasoning"]["effort"], "high");
     }
@@ -128,7 +79,7 @@ mod tests {
             "reasoning": {"effort": "high"}
         });
 
-        normalize_request_for_upstream(deepseek(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["reasoning"]["effort"], "high");
     }
@@ -143,7 +94,7 @@ mod tests {
             "reasoning": {"effort": "high"}
         });
 
-        normalize_request_for_upstream(standard(), &mut request);
+        normalize_request_for_upstream(&standard(), &mut request);
 
         assert_eq!(request["store"], true);
         assert_eq!(
@@ -191,7 +142,7 @@ mod tests {
             ]
         });
 
-        normalize_request_for_upstream(standard(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(
             request["tools"],
@@ -278,7 +229,7 @@ mod tests {
             ]
         });
 
-        normalize_request_for_upstream(deepseek(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(
             request["tools"],
@@ -327,7 +278,7 @@ mod tests {
             ]
         });
 
-        normalize_request_for_upstream(standard(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(
             request["tools"],
@@ -356,10 +307,37 @@ mod tests {
             ]
         });
 
-        normalize_request_for_upstream(deepseek(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["tools"][0]["name"], "exec");
         assert_eq!(request["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn standard_channel_preserves_additional_tools_item() {
+        let mut request = json!({
+            "model": "gpt-5.6-sol",
+            "instructions": "Keep the latest Responses API shape.",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [{"type": "function", "name": "wait"}]
+                        }
+                    ]
+                },
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let original = request.clone();
+
+        normalize_request_for_upstream(&standard(), &mut request);
+
+        assert_eq!(request, original);
     }
 
     #[test]
@@ -370,7 +348,7 @@ mod tests {
             "reasoning": {"effort": "high"}
         });
 
-        normalize_request_for_upstream(deepseek(), &mut request);
+        normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["store"], false);
         assert_eq!(request["include"], json!(["file_search_call.results"]));

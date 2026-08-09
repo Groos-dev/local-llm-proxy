@@ -1,138 +1,149 @@
-use crate::channel::ChannelKind;
 use crate::model::ModelRoute;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-/// Channel-aware compact fallback when upstream `/responses/compact` fails.
-/// DeepSeek (Ada) has no compact endpoint; Standard channels pass the failure through.
-pub fn compact_fallback(route: ModelRoute, request: &Value) -> Option<Value> {
-    match route.channel {
-        ChannelKind::DeepSeek => Some(build_local_compact_response(route, request)),
-        ChannelKind::Standard => None,
+const DEFAULT_COMPACT_PROMPT: &str = "Summarize the conversation so far. Preserve the user's goals, important decisions, completed work, unresolved issues, and the next steps needed to continue. Be concise but retain details that are necessary for the next model turn.";
+
+pub fn build_model_fallback_request(route: &ModelRoute, request: &Value) -> Value {
+    let mut body = request.clone();
+    body["model"] = Value::String(route.origin_model.clone());
+
+    let input = body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .map(|input| {
+            input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": DEFAULT_COMPACT_PROMPT}]
+            }));
+            input.clone()
+        })
+        .unwrap_or_else(|| {
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": DEFAULT_COMPACT_PROMPT}]
+            })]
+        });
+    body["input"] = Value::Array(input);
+
+    body["tools"] = json!([]);
+    body["parallel_tool_calls"] = Value::Bool(false);
+    if body.get("tool_choice").is_none() {
+        body["tool_choice"] = Value::String("auto".to_string());
     }
+    body["store"] = Value::Bool(false);
+    body["stream"] = Value::Bool(true);
+    if body.get("include").is_none() {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+    body
 }
 
-/// Build a Codex-compatible compact response when upstream `/responses/compact` is unavailable.
-/// Keeps user/developer messages and appends one `compaction` item.
-pub fn build_local_compact_response(route: ModelRoute, request: &Value) -> Value {
-    let input = request
-        .get("input")
-        .and_then(|input| input.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let mut output = Vec::new();
-    let mut omitted = 0usize;
-    for item in input {
-        if is_retained_compact_message(&item) {
-            output.push(item);
-        } else {
-            omitted += 1;
-        }
+pub fn compact_response_from_model_response(route: &ModelRoute, response: Value) -> Option<Value> {
+    let output = response
+        .get("output")
+        .or_else(|| response.pointer("/response/output"))
+        .and_then(Value::as_array)?
+        .clone();
+    if output.is_empty() {
+        return None;
     }
-
-    let mut compaction = serde_json::json!({
-        "type": "compaction",
-        "encrypted_content": format!(
-            "local-llm-proxy compacted {omitted} items for {}",
-            route.origin_model
-        ),
-    });
-    if let Some(turn_id) = request.pointer("/client_metadata/turn_id") {
-        compaction["internal_chat_message_metadata_passthrough"] =
-            serde_json::json!({ "turn_id": turn_id.clone() });
-    }
-    output.push(compaction);
-
-    serde_json::json!({
+    Some(json!({
         "model": route.public_model,
         "output": output,
-    })
-}
-
-fn is_retained_compact_message(item: &Value) -> bool {
-    let role = item.get("role").and_then(|role| role.as_str());
-    let is_user_or_developer = matches!(role, Some("user" | "developer"));
-    if !is_user_or_developer {
-        return false;
-    }
-    match item.get("type").and_then(|value| value.as_str()) {
-        None | Some("message") => true,
-        _ => false,
-    }
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::route_for_public_model;
-    use serde_json::json;
+    use crate::ChannelKind;
+
+    fn route(channel: ChannelKind, public_model: &str, origin_model: &str) -> ModelRoute {
+        ModelRoute {
+            origin_model: origin_model.to_string(),
+            public_model: public_model.to_string(),
+            provider_name: "provider".to_string(),
+            upstream_base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            channel,
+            supports_compact: false,
+        }
+    }
 
     #[test]
-    fn builds_local_compact_keeping_user_developer_and_appending_compaction() {
-        let route = route_for_public_model("gpt-5.6-terra").unwrap();
+    fn model_fallback_request_matches_normal_codex_compaction_request() {
+        let route = route(
+            ChannelKind::DeepSeek,
+            "gpt-5.6-terra",
+            "DeepSeek-V4-Pro-discount",
+        );
         let request = json!({
             "model": "DeepSeek-V4-Pro-discount",
-            "client_metadata": {"turn_id": "turn-123"},
-            "input": [
-                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "sys"}]},
-                {"type": "function_call", "name": "exec", "call_id": "c1", "arguments": "{}"},
-                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "keep me"}]},
-                {"type": "custom_tool_call_output", "call_id": "c1", "output": "out"}
-            ]
+            "instructions": "base instructions",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            "tools": [{"type": "function", "name": "exec"}],
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high"},
+            "service_tier": "priority",
+            "prompt_cache_key": "cache-key",
+            "text": {"verbosity": "low"}
         });
 
-        let body = build_local_compact_response(route, &request);
-        let output = body["output"].as_array().unwrap();
+        let body = build_model_fallback_request(&route, &request);
+        let input = body["input"].as_array().unwrap();
 
-        assert_eq!(output.len(), 3);
-        assert_eq!(output[0]["role"], "developer");
-        assert_eq!(output[1]["role"], "user");
-        assert_eq!(output[1]["content"][0]["text"], "keep me");
-        assert_eq!(output[2]["type"], "compaction");
+        assert_eq!(body["model"], "DeepSeek-V4-Pro-discount");
+        assert_eq!(body["instructions"], "base instructions");
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["prompt_cache_key"], "cache-key");
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
         assert!(
-            output[2]["encrypted_content"]
+            input[1]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("DeepSeek-V4-Pro-discount")
+                .contains("conversation")
         );
-        assert_eq!(
-            output[2]["internal_chat_message_metadata_passthrough"]["turn_id"],
-            "turn-123"
-        );
-        assert_eq!(body["model"], "gpt-5.6-terra");
     }
 
     #[test]
-    fn local_compact_keeps_role_only_messages_without_type() {
-        let route = route_for_public_model("gpt-5.6-luna").unwrap();
-        let request = json!({
-            "input": [
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "ignored"}
-            ]
+    fn model_response_is_wrapped_as_compact_response() {
+        let route = route(ChannelKind::Standard, "gpt-5.6-sol", "glm-5.2-discount");
+        let response = json!({
+            "id": "resp-1",
+            "model": "glm-5.2-discount",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "summary"}]
+            }]
         });
 
-        let body = build_local_compact_response(route, &request);
-        let output = body["output"].as_array().unwrap();
-        assert_eq!(output.len(), 2);
-        assert_eq!(output[0]["role"], "user");
-        assert_eq!(output[1]["type"], "compaction");
+        let compact = compact_response_from_model_response(&route, response).unwrap();
+
+        assert_eq!(compact["model"], "gpt-5.6-sol");
+        assert_eq!(compact["output"][0]["role"], "assistant");
+        assert_eq!(compact["output"][0]["content"][0]["text"], "summary");
+        assert_eq!(compact.as_object().unwrap().len(), 2);
     }
 
     #[test]
-    fn deepseek_channel_provides_compact_fallback() {
-        let route = route_for_public_model("gpt-5.6-terra").unwrap();
-        let request = json!({"input": [{"role": "user", "content": "hi"}]});
-        let body = compact_fallback(route, &request).unwrap();
-        assert_eq!(body["model"], "gpt-5.6-terra");
-        assert_eq!(body["output"].as_array().unwrap().last().unwrap()["type"], "compaction");
-    }
+    fn invalid_model_response_cannot_be_returned_as_compact_response() {
+        let route = route(ChannelKind::Standard, "gpt-5.6-sol", "glm-5.2-discount");
 
-    #[test]
-    fn standard_channel_has_no_compact_fallback() {
-        let route = route_for_public_model("gpt-5.6-sol").unwrap();
-        let request = json!({"input": [{"role": "user", "content": "hi"}]});
-        assert!(compact_fallback(route, &request).is_none());
+        assert!(compact_response_from_model_response(&route, json!({"id": "resp-1"})).is_none());
+        assert!(compact_response_from_model_response(&route, json!({"output": []})).is_none());
     }
 }

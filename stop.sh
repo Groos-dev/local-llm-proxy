@@ -12,8 +12,12 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-BIND_ADDR="${BIND_ADDR:-127.0.0.1:8787}"
-port="${BIND_ADDR##*:}"
+bind_addr="${BIND_ADDR:-}"
+if [[ -z "$bind_addr" && -f "${CONFIG_PATH:-$ROOT/config.toml}" ]]; then
+  bind_addr="$(sed -n 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "${CONFIG_PATH:-$ROOT/config.toml}" | head -n 1)"
+fi
+bind_addr="${bind_addr:-127.0.0.1:8787}"
+port="${bind_addr##*:}"
 
 stopped=0
 

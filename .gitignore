@@ -1,5 +1,6 @@
 /target/
 /.run/
+/.idea/
 .env
 *.pid
 .DS_Store

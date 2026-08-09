@@ -7,7 +7,7 @@ pub struct SseModelRestorer {
 }
 
 impl SseModelRestorer {
-    pub fn push(&mut self, chunk: &[u8], route: ModelRoute) -> Vec<Vec<u8>> {
+    pub fn push(&mut self, chunk: &[u8], route: &ModelRoute) -> Vec<Vec<u8>> {
         self.pending.extend_from_slice(chunk);
         let mut events = Vec::new();
 
@@ -19,7 +19,7 @@ impl SseModelRestorer {
         events
     }
 
-    pub fn finish(self, route: ModelRoute) -> Option<Vec<u8>> {
+    pub fn finish(self, route: &ModelRoute) -> Option<Vec<u8>> {
         (!self.pending.is_empty()).then(|| normalize_sse_event(self.pending, route))
     }
 }
@@ -37,7 +37,7 @@ fn find_sse_event_end(bytes: &[u8]) -> Option<usize> {
         })
 }
 
-fn normalize_sse_event(event: Vec<u8>, route: ModelRoute) -> Vec<u8> {
+fn normalize_sse_event(event: Vec<u8>, route: &ModelRoute) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(&event) else {
         return event;
     };
@@ -64,29 +64,41 @@ fn normalize_sse_event(event: Vec<u8>, route: ModelRoute) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::route_for_public_model;
+    use crate::{ChannelKind, ModelRoute};
+
+    fn route() -> ModelRoute {
+        ModelRoute {
+            origin_model: "upstream-model".to_string(),
+            public_model: "public-model".to_string(),
+            provider_name: "provider".to_string(),
+            upstream_base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            channel: ChannelKind::DeepSeek,
+            supports_compact: false,
+        }
+    }
 
     #[test]
     fn restores_internal_deployment_ids_in_split_sse_events() {
-        let route = route_for_public_model("gpt-5.6-luna").unwrap();
+        let route = route();
         let event = concat!(
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"ep-07p4u7vn\"}}\n\n"
         );
         let mut restorer = SseModelRestorer::default();
-        let mut output = restorer.push(&event.as_bytes()[..42], route);
+        let mut output = restorer.push(&event.as_bytes()[..42], &route);
         assert!(output.is_empty());
-        output.extend(restorer.push(&event.as_bytes()[42..], route));
+        output.extend(restorer.push(&event.as_bytes()[42..], &route));
 
         assert_eq!(output.len(), 1);
         let body = std::str::from_utf8(&output[0]).unwrap();
-        assert!(body.contains("gpt-5.6-luna"));
+        assert!(body.contains("public-model"));
         assert!(!body.contains("ep-07p4u7vn"));
     }
 
     #[test]
     fn preserves_codex_event_types_and_crlf_framing() {
-        let route = route_for_public_model("gpt-5.6-terra").unwrap();
+        let route = route();
         let stream = concat!(
             "event: response.created\r\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\r\n\r\n",
@@ -98,20 +110,20 @@ mod tests {
             "data: {\"type\":\"response.failed\",\"response\":{\"model\":\"deployment-id\"}}\r\n\r\n"
         );
         let mut restorer = SseModelRestorer::default();
-        let events = restorer.push(stream.as_bytes(), route);
+        let events = restorer.push(stream.as_bytes(), &route);
         assert_eq!(events.len(), 4);
         let text = String::from_utf8(events.concat()).unwrap();
         assert!(text.contains("response.created"));
         assert!(text.contains("response.reasoning_summary_text.delta"));
         assert!(text.contains("response.custom_tool_call_input.delta"));
         assert!(text.contains("response.failed"));
-        assert!(text.contains("gpt-5.6-terra"));
+        assert!(text.contains("public-model"));
         assert!(!text.contains("deployment-id"));
     }
 
     #[test]
     fn strips_reasoning_content_in_sse_output_item_events() {
-        let route = route_for_public_model("gpt-5.6-terra").unwrap();
+        let route = route();
         let stream = concat!(
             "event: response.output_item.done\r\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"c\",\"call_id\":\"c\",\"name\":\"get_weather\",\"arguments\":\"{}\",\"reasoning_content\":\"think\"}}\r\n\r\n",
@@ -119,11 +131,11 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"ep-5e9quh5a\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"think\"}]},{\"type\":\"function_call\",\"id\":\"c\",\"call_id\":\"c\",\"name\":\"get_weather\",\"arguments\":\"{}\",\"reasoning_content\":\"think\"}]}}\r\n\r\n"
         );
         let mut restorer = SseModelRestorer::default();
-        let events = restorer.push(stream.as_bytes(), route);
+        let events = restorer.push(stream.as_bytes(), &route);
         let text = String::from_utf8(events.concat()).unwrap();
 
         assert!(text.contains("\"type\":\"reasoning\""));
-        assert!(text.contains("gpt-5.6-terra"));
+        assert!(text.contains("public-model"));
         assert!(!text.contains("reasoning_content"));
         assert!(!text.contains("ep-5e9quh5a"));
     }

@@ -1,6 +1,7 @@
 mod deepseek;
 mod standard;
 
+use serde::Deserialize;
 use serde_json::Value;
 
 /// Upstream-specific Responses adaptations.
@@ -10,11 +11,13 @@ pub trait UpstreamChannel {
     fn normalize_response(&self, _body: &mut Value) {}
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum ChannelKind {
     /// Standard Responses API: no request/response rewriting beyond model mapping.
+    #[serde(rename = "standard")]
     Standard,
     /// DeepSeek via Ada: tool/thinking quirks and non-standard fields.
+    #[serde(rename = "deepseek")]
     DeepSeek,
 }
 
