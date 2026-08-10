@@ -1,0 +1,22 @@
+provider.sh
+  s_143a3f68e20105::t_b4b0c1a1299f4d 1-102,105-114,117-127
+  s_143a3f68e20105::t_cb2892b01fcb3d 103-104,115-116
+AGENTS.md
+  s_143a3f68e20105::t_778fe6e8d5bd47 31-32,35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.39-trip",
+  "base_commit_sha": "730e79b8ac46e8f13270641992dcd31dcf507529",
+  "prompts": {},
+  "sessions": {
+    "s_143a3f68e20105": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "6ea72493-45ab-4170-bfc8-6fc61685227a",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    }
+  }
+}
