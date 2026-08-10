@@ -1,0 +1,33 @@
+src/channel/tool_compat.rs
+  s_143a3f68e20105::t_c7702ea5a84261 285-289,307-311
+  s_143a3f68e20105::t_0e51ce17e163d1 192-284,290-306,312-343
+src/sse.rs
+  s_143a3f68e20105::t_fe52648c07d44f 1,5,11,13,33-36,72,77-80,84-85,120-142,145-146,149-150,157,174,178,183,185,272-295
+  s_143a3f68e20105::t_1b76c869dfab8e 4,6,12,14,24-26,32,53-57,59,63-64,76,81-83,86-88,90-93,97-119,143-144,147-148,151-156,158-173,175-177,179-182,184,186-190
+src/response.rs
+  s_143a3f68e20105::t_15d9a2b40d755c 106-149
+src/channel/mod.rs
+  s_143a3f68e20105::t_fc03fa2dbd7730 4
+src/request.rs
+  s_143a3f68e20105::t_5efde1d4ac7219 151-158,161-162,164,166-169
+  s_143a3f68e20105::t_16bb61fd19cce7 220-226,228-229
+src/channel/deepseek.rs
+  s_143a3f68e20105::t_2807c70046ce5e 231-242
+  s_143a3f68e20105::t_3c375988f3d7e1 3-4,14,40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.39-trip",
+  "base_commit_sha": "57c802ace821af795c8c295baf40a668c6289270",
+  "prompts": {},
+  "sessions": {
+    "s_143a3f68e20105": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "6ea72493-45ab-4170-bfc8-6fc61685227a",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    }
+  }
+}
