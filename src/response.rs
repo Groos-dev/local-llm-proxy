@@ -103,4 +103,48 @@ mod tests {
         assert!(body["output"][0].get("reasoning_content").is_none());
         assert_eq!(body["output"][0]["arguments"], "{\"ms\":1}");
     }
+
+    #[test]
+    fn deepseek_rewrites_exec_command_and_json_exec_input_to_js() {
+        let route = route(ChannelKind::DeepSeek);
+        let mut body = json!({
+            "model": "ep-1",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "c1",
+                    "call_id": "c1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\",\"workdir\":\"/tmp\"}",
+                    "reasoning_content": "run"
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "c2",
+                    "call_id": "c2",
+                    "name": "exec",
+                    "input": "{\"cmd\":\"ls\"}"
+                }
+            ]
+        });
+
+        normalize_response_for_client(&route, &mut body);
+
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert_eq!(body["output"][0]["name"], "exec");
+        assert!(
+            body["output"][0]["input"]
+                .as_str()
+                .unwrap()
+                .starts_with("await tools.exec_command(JSON.parse(")
+        );
+        assert!(body["output"][0].get("arguments").is_none());
+        assert!(body["output"][0].get("reasoning_content").is_none());
+        assert!(
+            body["output"][1]["input"]
+                .as_str()
+                .unwrap()
+                .starts_with("await tools.exec_command(JSON.parse(")
+        );
+    }
 }

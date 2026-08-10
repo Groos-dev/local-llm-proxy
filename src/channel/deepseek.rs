@@ -1,6 +1,7 @@
 use super::UpstreamChannel;
 use super::tool_compat::{
-    promote_additional_tools, serialize_parallel_tool_calls, strip_tool_call_reasoning_content,
+    normalize_exec_tool_calls, promote_additional_tools, rewrite_exec_tool_description,
+    serialize_parallel_tool_calls, strip_tool_call_reasoning_content,
 };
 use serde_json::Value;
 
@@ -10,6 +11,7 @@ impl UpstreamChannel for DeepSeekChannel {
     fn normalize_request(&self, body: &mut Value) {
         // Responses Lite puts tools under input.additional_tools; promote to top-level tools.
         promote_additional_tools(body);
+        rewrite_exec_tool_description(body);
         // Ada DeepSeek session state is unreliable; Codex also defaults to store=false.
         if body.get("store").is_some() {
             body["store"] = Value::Bool(false);
@@ -35,6 +37,7 @@ impl UpstreamChannel for DeepSeekChannel {
     }
 
     fn normalize_response(&self, body: &mut Value) {
+        normalize_exec_tool_calls(body);
         strip_tool_call_reasoning_content(body);
     }
 }
@@ -225,6 +228,18 @@ mod tests {
 
         assert_eq!(request["tools"][0]["type"], "custom");
         assert_eq!(request["tools"][0]["name"], "exec");
+        assert!(
+            request["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("HARD RULES for `exec`")
+        );
+        assert!(
+            request["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Run JS")
+        );
         assert_eq!(request["tools"][1]["type"], "function");
         assert_eq!(request["tools"][1]["name"], "wait");
         assert_eq!(request["input"].as_array().unwrap().len(), 1);
