@@ -28,9 +28,11 @@ cargo fmt --check           # Verify Rust formatting
 cargo clippy --all-targets  # Run Rust lints
 ./start.sh                  # Build and start locally on 127.0.0.1:8787
 ./stop.sh                   # Stop the proxy and clear exchange logs
+./provider.sh list          # Show configured providers and the active one
+./provider.sh use <name>    # Switch the runtime active provider (no restart)
 ```
 
-`./start.sh` loads `CONFIG_PATH` (default `config.toml`). Keep endpoints, `api_key`, `default_provider`, model mappings, adapter names, and `supports_compact` in the local (gitignored) `config.toml`. Copy `config.example.toml` to `config.toml` and fill in credentials. Optional `BIND_ADDR` / `EXCHANGE_LOG_DIR` env vars still override TOML.
+`./start.sh` loads `CONFIG_PATH` (default `config.toml`). Keep endpoints, `api_key`, `default_provider`, model mappings, adapter names, and `supports_compact` in the local (gitignored) `config.toml`. Copy `config.example.toml` to `config.toml` and fill in credentials. Optional `BIND_ADDR` / `EXCHANGE_LOG_DIR` env vars still override TOML. `./provider.sh` uses the same `bind_addr` resolution (or `PROXY_BASE`) against `GET`/`PUT /v1/admin/active-provider`.
 
 ## Coding Style & Naming Conventions
 
