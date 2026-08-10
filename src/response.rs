@@ -83,4 +83,24 @@ mod tests {
         assert_eq!(body["model"], "public-model");
         assert_eq!(body["output"][0]["reasoning_content"], "keep me");
     }
+
+    #[test]
+    fn glm_channel_strips_reasoning_content_from_tool_calls() {
+        let route = route(ChannelKind::Glm);
+        let mut body = json!({
+            "model": "glm-5.2-discount",
+            "output": [{
+                "type": "function_call",
+                "name": "wait",
+                "arguments": "{\"ms\":1}",
+                "reasoning_content": "think"
+            }]
+        });
+
+        normalize_response_for_client(&route, &mut body);
+
+        assert_eq!(body["model"], "public-model");
+        assert!(body["output"][0].get("reasoning_content").is_none());
+        assert_eq!(body["output"][0]["arguments"], "{\"ms\":1}");
+    }
 }

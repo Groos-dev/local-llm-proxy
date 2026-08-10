@@ -6,7 +6,7 @@ This repository is a Rust 2024 compatibility layer for a personal LLM provider. 
 
 - `src/model.rs`: public-to-upstream model routing and model list generation.
 - `src/request.rs` and `src/response.rs`: request/response normalization.
-- `src/channel/`: upstream-specific adaptations, including DeepSeek and standard channels.
+- `src/channel/`: upstream-specific adaptations, including DeepSeek, GLM, and standard channels.
 - `src/sse.rs`: streaming response rewriting.
 - `src/compact.rs`: compact-response fallback behavior.
 - `src/exchange.rs`: request/response exchange logging.
