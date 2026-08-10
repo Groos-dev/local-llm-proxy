@@ -1,0 +1,25 @@
+src/channel/glm.rs
+  s_143a3f68e20105::t_eda4badaa8ce3e 3-4,14,20
+src/channel/tool_compat.rs
+  s_143a3f68e20105::t_618606b47bbe6e 196-197,200,223,257-267,276,281-293,308-312,314,355-370,379-421
+src/sse.rs
+  s_143a3f68e20105::t_ad349550e2fb52 1-3,8,13-14,16,42-45,83-85,129,139,141-144,150,154,160,166,174,181-182,301-325
+src/response.rs
+  s_143a3f68e20105::t_8bc6c141911f92 150-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.39-trip",
+  "base_commit_sha": "98aa1f06a44be6a2e24c8ff4dc4de72573cc81ab",
+  "prompts": {},
+  "sessions": {
+    "s_143a3f68e20105": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "6ea72493-45ab-4170-bfc8-6fc61685227a",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    }
+  }
+}
