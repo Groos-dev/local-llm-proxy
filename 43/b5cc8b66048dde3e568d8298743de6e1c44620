@@ -1,0 +1,34 @@
+AGENTS.md
+  s_143a3f68e20105::t_878379935fcb9f 9
+  s_143a3f68e20105::t_b44c82887eeaa5 13-14
+  s_4d8b505b5c9716::t_1cafc3e68aa81f 18
+  s_143a3f68e20105::t_778fe6e8d5bd47 31-32,35
+  s_143a3f68e20105::t_803dc40a11c25a 47
+provider.sh
+  s_143a3f68e20105::t_b4b0c1a1299f4d 1-102,105-114,117-127
+  s_143a3f68e20105::t_cb2892b01fcb3d 103-104,115-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.39-trip",
+  "base_commit_sha": "43b5cc8b66048dde3e568d8298743de6e1c44620",
+  "prompts": {},
+  "sessions": {
+    "s_143a3f68e20105": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "6ea72493-45ab-4170-bfc8-6fc61685227a",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    },
+    "s_4d8b505b5c9716": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "823d6a88-9056-4176-af05-3d03b835f278",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    }
+  }
+}
