@@ -20,10 +20,16 @@ if [[ -n "${BIND_ADDR:-}" ]]; then
   export BIND_ADDR
 fi
 
+bind_addr="${BIND_ADDR:-}"
+if [[ -z "$bind_addr" && -f "$CONFIG_PATH" ]]; then
+  bind_addr="$(sed -n 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$CONFIG_PATH" | head -n 1)"
+fi
+bind_addr="${bind_addr:-127.0.0.1:8787}"
+
 if [[ -f "$PID_FILE" ]]; then
   old_pid="$(cat "$PID_FILE")"
   if kill -0 "$old_pid" 2>/dev/null; then
-    echo "already running pid=$old_pid bind=$BIND_ADDR"
+    echo "already running pid=$old_pid bind=$bind_addr"
     exit 0
   fi
   rm -f "$PID_FILE"
@@ -39,11 +45,6 @@ export EXCHANGE_LOG_DIR="${EXCHANGE_LOG_DIR:-$RUN_DIR/exchanges}"
 nohup "$ROOT/target/debug/local-llm-proxy" >"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
 
-bind_addr="${BIND_ADDR:-}"
-if [[ -z "$bind_addr" && -f "$CONFIG_PATH" ]]; then
-  bind_addr="$(sed -n 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$CONFIG_PATH" | head -n 1)"
-fi
-bind_addr="${bind_addr:-127.0.0.1:8787}"
 host="${bind_addr%:*}"
 port="${bind_addr##*:}"
 for _ in $(seq 1 40); do
