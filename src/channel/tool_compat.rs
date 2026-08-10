@@ -193,10 +193,11 @@ fn strip_reasoning_content_from_item(item: &mut Value) {
 const EXEC_DESCRIPTION_PREFIX: &str = "\
 HARD RULES for `exec` (read first):
 - `exec` is a JavaScript orchestrator, NOT a shell. Never pass JSON like {\"cmd\":...} as the tool input.
-- Never emit a top-level `function_call` named `exec_command`. Shell runs only via nested JS: `await tools.exec_command({cmd, workdir})`.
+- Never emit a top-level `function_call` named `exec_command` or `apply_patch`. Those are nested only.
+- Shell: `await tools.exec_command({cmd, workdir})`. Patches: `await tools.apply_patch(\"*** Begin Patch\\n...\")` (raw patch text, not JSON).
 - Tool input must be raw JavaScript source (optionally starting with `// @exec: {...}`), not JSON, not a quoted string, not markdown fences.
 - Correct: `await tools.exec_command({cmd: \"git status\", workdir: \"/path\"});`
-- Wrong: `{\"cmd\":\"git status\"}` as `exec` input, or `function_call`/`exec_command`.
+- Wrong: `{\"cmd\":\"git status\"}` as `exec` input, or top-level `function_call`/`exec_command`/`apply_patch`.
 
 ";
 
@@ -219,7 +220,7 @@ pub(crate) fn rewrite_exec_tool_description(body: &mut Value) {
     }
 }
 
-/// Fix DeepSeek misuse: `function_call`/`exec_command` and JSON `exec` inputs → JS `custom_tool_call`.
+/// Fix model misuse: top-level `exec_command`/`apply_patch` and JSON `exec` inputs → JS `custom_tool_call`.
 pub(crate) fn normalize_exec_tool_calls(body: &mut Value) {
     if let Some(item) = body.get_mut("item") {
         normalize_exec_tool_item(item);
@@ -253,14 +254,17 @@ fn normalize_exec_tool_item(item: &mut Value) {
             .and_then(Value::as_str)
             .unwrap_or("{}")
             .to_string();
-        let input = wrap_exec_command_js(&args);
-        let Some(object) = item.as_object_mut() else {
-            return;
-        };
-        object.insert("type".to_string(), Value::String("custom_tool_call".to_string()));
-        object.insert("name".to_string(), Value::String("exec".to_string()));
-        object.insert("input".to_string(), Value::String(input));
-        object.remove("arguments");
+        rewrite_function_call_to_exec(item, wrap_exec_command_js(&args));
+        return;
+    }
+
+    if item_type == "function_call" && name == "apply_patch" {
+        let args = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        rewrite_function_call_to_exec(item, wrap_apply_patch_js(&args));
         return;
     }
 
@@ -269,10 +273,22 @@ fn normalize_exec_tool_item(item: &mut Value) {
             return;
         };
         if looks_like_exec_command_json(input) {
-            let wrapped = wrap_exec_command_js(input);
-            item["input"] = Value::String(wrapped);
+            item["input"] = Value::String(wrap_exec_command_js(input));
         }
     }
+}
+
+fn rewrite_function_call_to_exec(item: &mut Value, input: String) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "type".to_string(),
+        Value::String("custom_tool_call".to_string()),
+    );
+    object.insert("name".to_string(), Value::String("exec".to_string()));
+    object.insert("input".to_string(), Value::String(input));
+    object.remove("arguments");
 }
 
 fn normalize_exec_stream_event(body: &mut Value) {
@@ -289,10 +305,13 @@ fn normalize_exec_stream_event(body: &mut Value) {
             else {
                 return;
             };
-            if !looks_like_exec_command_json(&args) {
+            let input = if looks_like_exec_command_json(&args) {
+                wrap_exec_command_js(&args)
+            } else if looks_like_apply_patch_args(&args) {
+                wrap_apply_patch_js(&args)
+            } else {
                 return;
-            }
-            let input = wrap_exec_command_js(&args);
+            };
             let Some(object) = body.as_object_mut() else {
                 return;
             };
@@ -333,6 +352,22 @@ pub(crate) fn looks_like_exec_command_json(raw: &str) -> bool {
         .is_some_and(|cmd| !cmd.is_empty())
 }
 
+pub(crate) fn looks_like_apply_patch_args(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.contains("*** Begin Patch") || trimmed.contains("*** Update File") {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    value
+        .get("input")
+        .and_then(Value::as_str)
+        .is_some_and(|input| {
+            input.contains("*** Begin Patch") || input.contains("*** Update File")
+        })
+}
+
 pub(crate) fn wrap_exec_command_js(args_json: &str) -> String {
     let trimmed = args_json.trim();
     if trimmed.starts_with("await tools.exec_command") {
@@ -340,4 +375,48 @@ pub(crate) fn wrap_exec_command_js(args_json: &str) -> String {
     }
     let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"{}\"".to_string());
     format!("await tools.exec_command(JSON.parse({literal}));")
+}
+
+pub(crate) fn wrap_apply_patch_js(args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.starts_with("await tools.apply_patch") {
+        return trimmed.to_string();
+    }
+    let patch = extract_apply_patch_text(trimmed);
+    let literal = serde_json::to_string(&patch).unwrap_or_else(|_| "\"\"".to_string());
+    format!("await tools.apply_patch({literal});")
+}
+
+fn extract_apply_patch_text(raw: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if let Some(input) = value.get("input").and_then(Value::as_str) {
+            return input.to_string();
+        }
+    }
+    if let Ok(as_string) = serde_json::from_str::<String>(raw) {
+        return as_string;
+    }
+    raw.to_string()
+}
+
+/// Which top-level function_call names we rewrite into nested `exec` JS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NestedFnRewrite {
+    ExecCommand,
+    ApplyPatch,
+}
+
+pub(crate) fn nested_fn_rewrite_for_name(name: &str) -> Option<NestedFnRewrite> {
+    match name {
+        "exec_command" => Some(NestedFnRewrite::ExecCommand),
+        "apply_patch" => Some(NestedFnRewrite::ApplyPatch),
+        _ => None,
+    }
+}
+
+pub(crate) fn wrap_nested_fn_js(kind: NestedFnRewrite, args: &str) -> String {
+    match kind {
+        NestedFnRewrite::ExecCommand => wrap_exec_command_js(args),
+        NestedFnRewrite::ApplyPatch => wrap_apply_patch_js(args),
+    }
 }

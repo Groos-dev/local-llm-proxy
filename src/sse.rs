@@ -1,17 +1,19 @@
-use crate::channel::tool_compat::wrap_exec_command_js;
+use crate::channel::tool_compat::{
+    nested_fn_rewrite_for_name, wrap_nested_fn_js, NestedFnRewrite,
+};
 use crate::model::ModelRoute;
 use crate::response::normalize_response_for_client;
 use crate::ChannelKind;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct SseModelRestorer {
     pending: Vec<u8>,
-    /// DeepSeek: item ids from `function_call`/`exec_command` (pre-rewrite).
-    exec_command_item_ids: HashSet<String>,
+    /// DeepSeek/GLM: item ids from top-level `function_call` we rewrite into `exec`.
+    nested_fn_ids: HashMap<String, NestedFnRewrite>,
     /// Buffered JSON argument fragments; flushed as wrapped JS on arguments.done.
-    exec_command_arg_bufs: HashMap<String, String>,
+    nested_fn_arg_bufs: HashMap<String, String>,
 }
 
 impl SseModelRestorer {
@@ -35,6 +37,10 @@ impl SseModelRestorer {
         }
         normalize_sse_event(std::mem::take(&mut self.pending), route, &mut self)
     }
+}
+
+fn rewrites_nested_fn_calls(channel: ChannelKind) -> bool {
+    matches!(channel, ChannelKind::DeepSeek | ChannelKind::Glm)
 }
 
 fn find_sse_event_end(bytes: &[u8]) -> Option<usize> {
@@ -74,9 +80,9 @@ fn normalize_sse_event(
             continue;
         };
 
-        if route.channel == ChannelKind::DeepSeek {
-            track_exec_command_item(&body, restorer);
-            match exec_command_sse_action(&mut body, restorer) {
+        if rewrites_nested_fn_calls(route.channel) {
+            track_nested_fn_item(&body, restorer);
+            match nested_fn_sse_action(&mut body, restorer) {
                 Some(SseAction::Drop) => {
                     drop_event = true;
                     break;
@@ -120,7 +126,7 @@ enum SseAction {
     Replace(Value),
 }
 
-fn track_exec_command_item(body: &Value, restorer: &mut SseModelRestorer) {
+fn track_nested_fn_item(body: &Value, restorer: &mut SseModelRestorer) {
     if body.get("type").and_then(Value::as_str) != Some("response.output_item.added") {
         return;
     }
@@ -130,52 +136,50 @@ fn track_exec_command_item(body: &Value, restorer: &mut SseModelRestorer) {
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
         return;
     }
-    if item.get("name").and_then(Value::as_str) != Some("exec_command") {
+    let Some(name) = item.get("name").and_then(Value::as_str) else {
         return;
-    }
+    };
+    let Some(kind) = nested_fn_rewrite_for_name(name) else {
+        return;
+    };
     if let Some(id) = item
         .get("id")
         .or_else(|| item.get("call_id"))
         .and_then(Value::as_str)
     {
-        restorer.exec_command_item_ids.insert(id.to_string());
+        restorer.nested_fn_ids.insert(id.to_string(), kind);
     }
 }
 
-fn exec_command_sse_action(
+fn nested_fn_sse_action(
     body: &mut Value,
     restorer: &mut SseModelRestorer,
 ) -> Option<SseAction> {
     let event_type = body.get("type").and_then(Value::as_str)?;
     let item_id = body.get("item_id").and_then(Value::as_str)?.to_string();
+    let kind = *restorer.nested_fn_ids.get(&item_id)?;
 
     match event_type {
         "response.function_call_arguments.delta" => {
-            if !restorer.exec_command_item_ids.contains(&item_id) {
-                return None;
-            }
             let delta = body.get("delta").and_then(Value::as_str).unwrap_or("");
             restorer
-                .exec_command_arg_bufs
+                .nested_fn_arg_bufs
                 .entry(item_id)
                 .or_default()
                 .push_str(delta);
             Some(SseAction::Drop)
         }
         "response.function_call_arguments.done" => {
-            if !restorer.exec_command_item_ids.contains(&item_id) {
-                return None;
-            }
             let args = restorer
-                .exec_command_arg_bufs
+                .nested_fn_arg_bufs
                 .remove(&item_id)
                 .or_else(|| {
                     body.get("arguments")
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 })
-                .unwrap_or_else(|| "{}".to_string());
-            let input = wrap_exec_command_js(&args);
+                .unwrap_or_default();
+            let input = wrap_nested_fn_js(kind, &args);
             let mut replacement = body.clone();
             if let Some(object) = replacement.as_object_mut() {
                 object.insert(
@@ -293,5 +297,31 @@ mod tests {
         assert!(text.contains("\"type\":\"custom_tool_call\""));
         assert!(text.contains("\"name\":\"exec\""));
         assert!(!text.contains("\"name\":\"exec_command\""));
+    }
+
+    #[test]
+    fn rewrites_apply_patch_sse_stream_to_custom_exec_js() {
+        let route = route();
+        let stream = concat!(
+            "event: response.output_item.added\r\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"call_p\",\"call_id\":\"call_p\",\"name\":\"apply_patch\",\"arguments\":\"\"}}\r\n\r\n",
+            "event: response.function_call_arguments.delta\r\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_p\",\"delta\":\"{\\\"input\\\":\\\"*** Begin Patch\\\\n*** Update File: a.txt\\\\n@@\\\\n-old\\\\n+new\\\\n*** End Patch\\\"}\"}\r\n\r\n",
+            "event: response.function_call_arguments.done\r\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"call_p\",\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\\n*** Update File: a.txt\\\\n@@\\\\n-old\\\\n+new\\\\n*** End Patch\\\"}\"}\r\n\r\n",
+            "event: response.output_item.done\r\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"call_p\",\"call_id\":\"call_p\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\\n*** Update File: a.txt\\\\n@@\\\\n-old\\\\n+new\\\\n*** End Patch\\\"}\"}}\r\n\r\n"
+        );
+        let mut restorer = SseModelRestorer::default();
+        let events = restorer.push(stream.as_bytes(), &route);
+        let text = String::from_utf8(events.concat()).unwrap();
+
+        assert!(!text.contains("function_call_arguments.delta"));
+        assert!(text.contains("response.custom_tool_call_input.done"));
+        assert!(text.contains("await tools.apply_patch("));
+        assert!(text.contains("*** Begin Patch"));
+        assert!(text.contains("\"type\":\"custom_tool_call\""));
+        assert!(text.contains("\"name\":\"exec\""));
+        assert!(!text.contains("\"name\":\"apply_patch\""));
     }
 }
