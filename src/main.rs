@@ -1,11 +1,11 @@
 use async_stream::stream;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::Response,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -14,10 +14,9 @@ use local_llm_proxy::{
     build_model_fallback_request, compact_response_from_model_response,
     normalize_request_for_upstream, normalize_response_for_client, rewrite_request_model,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap, convert::Infallible, env, fs, net::SocketAddr, path::PathBuf, sync::Arc,
-};
+use std::{convert::Infallible, env, fs, net::SocketAddr, path::PathBuf, sync::Arc, sync::RwLock};
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const MODELS_ETAG: &str = "local-llm-proxy-v1";
@@ -26,7 +25,13 @@ const MODELS_ETAG: &str = "local-llm-proxy-v1";
 struct AppState {
     client: reqwest::Client,
     registry: Arc<ProviderRegistry>,
+    active_provider: Arc<RwLock<String>>,
     exchange_log_dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetActiveProviderRequest {
+    provider: String,
 }
 
 #[tokio::main]
@@ -47,26 +52,13 @@ async fn main() {
         .or(config.exchange_log_dir.clone())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".run/exchanges"));
-    let api_keys = config
-        .providers
-        .iter()
-        .map(|provider| {
-            env::var(&provider.api_key_env)
-                .map(|key| (provider.name.clone(), key))
-                .map_err(|err| {
-                    format!(
-                        "provider '{}' requires {}: {err}",
-                        provider.name, provider.api_key_env
-                    )
-                })
-        })
-        .collect::<Result<HashMap<_, _>, _>>()
-        .unwrap_or_else(|err| panic!("invalid provider credentials: {err}"));
-    let registry = ProviderRegistry::new(config, api_keys)
+    let registry = ProviderRegistry::new(config)
         .unwrap_or_else(|err| panic!("invalid provider configuration: {err}"));
+    let active_provider = registry.default_provider().to_string();
     let _ = fs::create_dir_all(&exchange_log_dir);
     let state = AppState {
         client: reqwest::Client::new(),
+        active_provider: Arc::new(RwLock::new(active_provider)),
         registry: Arc::new(registry),
         exchange_log_dir,
     };
@@ -74,16 +66,67 @@ async fn main() {
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
+        .route("/v1/admin/active-provider", get(get_active_provider))
+        .route("/v1/admin/active-provider", put(put_active_provider))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
+fn active_provider_name(state: &AppState) -> String {
+    state
+        .active_provider
+        .read()
+        .expect("active_provider lock")
+        .clone()
+}
+
+fn active_provider_body(state: &AppState) -> Value {
+    json!({
+        "provider": active_provider_name(state),
+        "providers": state.registry.provider_names(),
+    })
+}
+
+fn route_for_active_model(state: &AppState, model: &str) -> Option<ModelRoute> {
+    state
+        .registry
+        .route_for_public_model(&active_provider_name(state), model)
+}
+
+async fn get_active_provider(State(state): State<AppState>) -> Response {
+    json_response(
+        StatusCode::OK,
+        active_provider_body(&state),
+        Some("application/json"),
+        false,
+    )
+}
+
+async fn put_active_provider(
+    State(state): State<AppState>,
+    Json(body): Json<SetActiveProviderRequest>,
+) -> Response {
+    let provider = body.provider.trim();
+    if provider.is_empty() || !state.registry.has_provider(provider) {
+        return error_response(StatusCode::BAD_REQUEST, "unknown provider");
+    }
+    *state.active_provider.write().expect("active_provider lock") = provider.to_string();
+    json_response(
+        StatusCode::OK,
+        active_provider_body(&state),
+        Some("application/json"),
+        false,
+    )
+}
+
 async fn models(State(state): State<AppState>) -> Response {
     json_response(
         StatusCode::OK,
-        state.registry.public_models_list(),
+        state
+            .registry
+            .public_models_list(&active_provider_name(&state)),
         Some("application/json"),
         true,
     )
@@ -102,7 +145,7 @@ async fn responses(State(state): State<AppState>, request: Request) -> Response 
     let Some(model) = codex_request.get("model").and_then(Value::as_str) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
-    let Some(route) = state.registry.route_for_public_model(model) else {
+    let Some(route) = route_for_active_model(&state, model) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
     let mut payload = codex_request.clone();
@@ -190,7 +233,7 @@ async fn compact(State(state): State<AppState>, request: Request) -> Response {
     let Some(model) = codex_request.get("model").and_then(Value::as_str) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
-    let Some(route) = state.registry.route_for_public_model(model) else {
+    let Some(route) = route_for_active_model(&state, model) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
     let mut payload = codex_request;

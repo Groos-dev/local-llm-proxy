@@ -10,11 +10,12 @@ This repository is a Rust 2024 compatibility layer for a personal LLM provider. 
 - `src/sse.rs`: streaming response rewriting.
 - `src/compact.rs`: compact-response fallback behavior.
 - `src/exchange.rs`: request/response exchange logging.
-- `config.toml`: default provider, model mapping, adapter, and compact capability configuration.
+- `config.toml`: local provider, credential, model mapping, adapter, and compact capability configuration (gitignored; copy from `config.example.toml`).
+- `config.example.toml`: committed template without real credentials.
 
 ## Architecture & Provider Configuration
 
-Load provider definitions from TOML rather than hard-coding deployment settings. Support multiple providers and one or more models per provider; each model names a built-in Rust response adapter, while compact capability belongs to the provider. Reference adapters by stable names; do not add executable configuration hooks. Runtime files belong under `.run/`, which is ignored by Git.
+Load provider definitions from TOML rather than hard-coding deployment settings. Support multiple providers and one or more models per provider; each model names a built-in Rust response adapter, while compact capability belongs to the provider. The same public model name may appear on multiple providers. Runtime routing uses `default_provider` at startup and can be switched without restart via `GET`/`PUT /v1/admin/active-provider`. `/v1/models` and request routing only expose the active provider's mappings. Reference adapters by stable names; do not add executable configuration hooks. Runtime files belong under `.run/`, which is ignored by Git.
 
 ## Build, Test, and Development Commands
 
@@ -29,7 +30,7 @@ cargo clippy --all-targets  # Run Rust lints
 ./stop.sh                   # Stop the proxy and clear exchange logs
 ```
 
-`./start.sh` loads `CONFIG_PATH` (default `config.toml`) and `.env`; each configured `api_key_env` must be set. Keep endpoints, model mappings, adapter names, and `supports_compact` in TOML; keep credentials in environment variables or another ignored secret store. Override `BIND_ADDR` and `EXCHANGE_LOG_DIR` as needed.
+`./start.sh` loads `CONFIG_PATH` (default `config.toml`). Keep endpoints, `api_key`, `default_provider`, model mappings, adapter names, and `supports_compact` in the local (gitignored) `config.toml`. Copy `config.example.toml` to `config.toml` and fill in credentials. Optional `BIND_ADDR` / `EXCHANGE_LOG_DIR` env vars still override TOML.
 
 ## Coding Style & Naming Conventions
 
@@ -41,4 +42,4 @@ Use Rust's built-in test framework with `#[cfg(test)]` modules colocated beside 
 
 ## Commit & Pull Request Guidelines
 
-Follow the concise Conventional Commit style already present in history, for example `feat: add ...` or `fix: handle ...`. Keep commits focused. Pull requests should explain the protocol or configuration impact, list validation commands run, link the relevant issue or task, and include request/response examples when API behavior changes. Do not commit API keys, `.env`, `.run/`, or generated logs.
+Follow the concise Conventional Commit style already present in history, for example `feat: add ...` or `fix: handle ...`. Keep commits focused. Pull requests should explain the protocol or configuration impact, list validation commands run, link the relevant issue or task, and include request/response examples when API behavior changes. Do not commit API keys, `config.toml`, `.env`, `.run/`, or generated logs.

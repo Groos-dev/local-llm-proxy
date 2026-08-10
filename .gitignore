@@ -4,5 +4,6 @@
 /docs/plans/
 /docs/specs/*-design.md
 .env
+/config.toml
 *.pid
 .DS_Store

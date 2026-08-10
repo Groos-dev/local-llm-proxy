@@ -1,0 +1,76 @@
+bind_addr = "127.0.0.1:8787"
+exchange_log_dir = ".run/exchanges"
+default_provider = "passthrough-a"
+
+[[providers]]
+name = "mapped"
+base_url = "https://provider-a.example/v1"
+api_key = "replace-me"
+supports_compact = false
+
+[[providers.models]]
+public_model = "gpt-5.6-luna"
+upstream_model = "upstream-flash"
+response_adapter = "deepseek"
+
+[[providers.models]]
+public_model = "gpt-5.6-terra"
+upstream_model = "upstream-pro"
+response_adapter = "deepseek"
+
+[[providers.models]]
+public_model = "gpt-5.6-sol"
+upstream_model = "upstream-sol"
+response_adapter = "standard"
+
+[[providers]]
+name = "passthrough-a"
+base_url = "https://provider-b.example/v1"
+api_key = "replace-me"
+supports_compact = true
+
+[[providers.models]]
+public_model = "gpt-5.6"
+upstream_model = "gpt-5.6"
+response_adapter = "standard"
+
+[[providers.models]]
+public_model = "gpt-5.6-luna"
+upstream_model = "gpt-5.6-luna"
+response_adapter = "standard"
+
+[[providers.models]]
+public_model = "gpt-5.6-sol"
+upstream_model = "gpt-5.6-sol"
+response_adapter = "standard"
+
+[[providers.models]]
+public_model = "gpt-5.6-terra"
+upstream_model = "gpt-5.6-terra"
+response_adapter = "standard"
+
+[[providers]]
+name = "passthrough-b"
+base_url = "https://provider-c.example/v1"
+api_key = "replace-me"
+supports_compact = true
+
+[[providers.models]]
+public_model = "gpt-5.6"
+upstream_model = "gpt-5.6"
+response_adapter = "standard"
+
+[[providers.models]]
+public_model = "gpt-5.6-luna"
+upstream_model = "gpt-5.6-luna"
+response_adapter = "standard"
+
+[[providers.models]]
+public_model = "gpt-5.6-sol"
+upstream_model = "gpt-5.6-sol"
+response_adapter = "standard"
+
+[[providers.models]]
+public_model = "gpt-5.6-terra"
+upstream_model = "gpt-5.6-terra"
+response_adapter = "standard"
