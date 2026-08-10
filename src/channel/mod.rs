@@ -1,5 +1,7 @@
 mod deepseek;
+mod glm;
 mod standard;
+mod tool_compat;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -19,6 +21,9 @@ pub enum ChannelKind {
     /// DeepSeek via Ada: tool/thinking quirks and non-standard fields.
     #[serde(rename = "deepseek")]
     DeepSeek,
+    /// GLM via Ada: promote additional_tools and serialize parallel tool batches.
+    #[serde(rename = "glm")]
+    Glm,
 }
 
 impl ChannelKind {
@@ -26,6 +31,7 @@ impl ChannelKind {
         match self {
             Self::Standard => standard::StandardChannel.normalize_request(body),
             Self::DeepSeek => deepseek::DeepSeekChannel.normalize_request(body),
+            Self::Glm => glm::GlmChannel.normalize_request(body),
         }
     }
 
@@ -33,6 +39,7 @@ impl ChannelKind {
         match self {
             Self::Standard => standard::StandardChannel.normalize_response(body),
             Self::DeepSeek => deepseek::DeepSeekChannel.normalize_response(body),
+            Self::Glm => glm::GlmChannel.normalize_response(body),
         }
     }
 }

@@ -253,7 +253,7 @@ response_adapter = "deepseek"
 [[providers.models]]
 public_model = "gpt-sol"
 upstream_model = "glm-5.2"
-response_adapter = "standard"
+response_adapter = "glm"
 
 [[providers]]
 name = "mmkg"
@@ -300,10 +300,10 @@ response_adapter = "standard"
         assert_eq!(deepseek_route.channel, ChannelKind::DeepSeek);
         assert!(!deepseek_route.supports_compact);
 
-        let same_provider_standard = registry.route_for_public_model("ada", "gpt-sol").unwrap();
-        assert_eq!(same_provider_standard.provider_name, "ada");
-        assert_eq!(same_provider_standard.channel, ChannelKind::Standard);
-        assert!(!same_provider_standard.supports_compact);
+        let same_provider_glm = registry.route_for_public_model("ada", "gpt-sol").unwrap();
+        assert_eq!(same_provider_glm.provider_name, "ada");
+        assert_eq!(same_provider_glm.channel, ChannelKind::Glm);
+        assert!(!same_provider_glm.supports_compact);
     }
 
     #[test]

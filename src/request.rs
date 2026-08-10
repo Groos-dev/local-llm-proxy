@@ -32,6 +32,10 @@ mod tests {
         route(ChannelKind::Standard)
     }
 
+    fn glm() -> ModelRoute {
+        route(ChannelKind::Glm)
+    }
+
     #[test]
     fn forces_effort_none_when_tool_choice_required() {
         let mut request = json!({
@@ -338,6 +342,49 @@ mod tests {
         normalize_request_for_upstream(&standard(), &mut request);
 
         assert_eq!(request, original);
+    }
+
+    #[test]
+    fn glm_channel_promotes_additional_tools_without_deepseek_rewrites() {
+        let mut request = json!({
+            "store": true,
+            "tool_choice": "required",
+            "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [{"type": "function", "name": "wait"}]
+                        }
+                    ]
+                },
+                {"type": "function_call", "call_id": "call_a", "name": "wait", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_b", "name": "wait", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "b"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "a"}
+            ]
+        });
+
+        normalize_request_for_upstream(&glm(), &mut request);
+
+        assert_eq!(request["tools"][0]["name"], "wait");
+        assert_eq!(request["store"], true);
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            request["input"],
+            json!([
+                {"type": "function_call", "call_id": "call_a", "name": "wait", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "a"},
+                {"type": "function_call", "call_id": "call_b", "name": "wait", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "b"}
+            ])
+        );
     }
 
     #[test]
