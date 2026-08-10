@@ -1,6 +1,7 @@
 use super::UpstreamChannel;
 use super::tool_compat::{
-    promote_additional_tools, serialize_parallel_tool_calls, strip_tool_call_reasoning_content,
+    promote_additional_tools, rewrite_exec_tool_description, serialize_parallel_tool_calls,
+    normalize_exec_tool_calls, strip_tool_call_reasoning_content,
 };
 use serde_json::Value;
 
@@ -10,11 +11,13 @@ impl UpstreamChannel for GlmChannel {
     fn normalize_request(&self, body: &mut Value) {
         // Ada GLM rejects non-top-level tools (additional_tools → 400).
         promote_additional_tools(body);
+        rewrite_exec_tool_description(body);
         // Ada GLM rejects parallel tool-call batches; serialize to call/output pairs.
         serialize_parallel_tool_calls(body);
     }
 
     fn normalize_response(&self, body: &mut Value) {
+        normalize_exec_tool_calls(body);
         strip_tool_call_reasoning_content(body);
     }
 }

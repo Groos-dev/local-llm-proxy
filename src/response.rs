@@ -147,4 +147,55 @@ mod tests {
                 .starts_with("await tools.exec_command(JSON.parse(")
         );
     }
+
+    #[test]
+    fn deepseek_rewrites_apply_patch_function_call_to_exec_js() {
+        let route = route(ChannelKind::DeepSeek);
+        let mut body = json!({
+            "model": "ep-1",
+            "output": [{
+                "type": "function_call",
+                "id": "c1",
+                "call_id": "c1",
+                "name": "apply_patch",
+                "arguments": "{\"input\":\"*** Begin Patch\\n*** Update File: a.txt\\n@@\\n-old\\n+new\\n*** End Patch\"}"
+            }]
+        });
+
+        normalize_response_for_client(&route, &mut body);
+
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert_eq!(body["output"][0]["name"], "exec");
+        let input = body["output"][0]["input"].as_str().unwrap();
+        assert!(input.starts_with("await tools.apply_patch("));
+        assert!(input.contains("*** Begin Patch"));
+        assert!(input.contains("*** Update File: a.txt"));
+        assert!(body["output"][0].get("arguments").is_none());
+    }
+
+    #[test]
+    fn glm_rewrites_apply_patch_function_call_to_exec_js() {
+        let route = route(ChannelKind::Glm);
+        let mut body = json!({
+            "model": "glm",
+            "output": [{
+                "type": "function_call",
+                "id": "c1",
+                "call_id": "c1",
+                "name": "apply_patch",
+                "arguments": "{\"input\":\"*** Begin Patch\\n*** Update File: b.txt\\n@@\\n-a\\n+b\\n*** End Patch\"}"
+            }]
+        });
+
+        normalize_response_for_client(&route, &mut body);
+
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert_eq!(body["output"][0]["name"], "exec");
+        assert!(
+            body["output"][0]["input"]
+                .as_str()
+                .unwrap()
+                .starts_with("await tools.apply_patch(")
+        );
+    }
 }
