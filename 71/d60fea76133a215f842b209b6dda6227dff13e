@@ -1,0 +1,40 @@
+src/response.rs
+  s_143a3f68e20105::t_00cc7998e18442 86-105
+src/channel/mod.rs
+  s_143a3f68e20105::t_b2d28b61f20182 2,4,24-26,34,42
+src/channel/tool_compat.rs
+  s_143a3f68e20105::t_7eec1130c6b06b 157-191
+  s_143a3f68e20105::t_04bbd5a71d8a4b 1-156
+src/channel/deepseek.rs
+  s_143a3f68e20105::t_542d6c3c9722e3 2-4
+AGENTS.md
+  s_143a3f68e20105::t_878379935fcb9f 9
+src/config.rs
+  s_143a3f68e20105::t_e0c2a25492af82 256
+  s_143a3f68e20105::t_81ed5ffa3cd5ca 303-306
+src/request.rs
+  s_143a3f68e20105::t_0e83bf572e6e6d 348-389
+  s_143a3f68e20105::t_0d191daae53f29 35-38
+src/channel/glm.rs
+  s_143a3f68e20105::t_76d57173e53e81 1,5-14,19-95,126
+  s_143a3f68e20105::t_645b351600655b 96-125
+  s_143a3f68e20105::t_98a0e2471beff7 2-4,15-18
+config.example.toml
+  s_143a3f68e20105::t_b876d1f991f9a1 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.39-trip",
+  "base_commit_sha": "71d60fea76133a215f842b209b6dda6227dff13e",
+  "prompts": {},
+  "sessions": {
+    "s_143a3f68e20105": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "6ea72493-45ab-4170-bfc8-6fc61685227a",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    }
+  }
+}
