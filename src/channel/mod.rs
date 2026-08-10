@@ -1,7 +1,7 @@
 mod deepseek;
 mod glm;
 mod standard;
-mod tool_compat;
+pub(crate) mod tool_compat;
 
 use serde::Deserialize;
 use serde_json::Value;

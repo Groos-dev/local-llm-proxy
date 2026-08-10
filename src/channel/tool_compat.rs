@@ -189,3 +189,155 @@ fn strip_reasoning_content_from_item(item: &mut Value) {
         }
     }
 }
+
+const EXEC_DESCRIPTION_PREFIX: &str = "\
+HARD RULES for `exec` (read first):
+- `exec` is a JavaScript orchestrator, NOT a shell. Never pass JSON like {\"cmd\":...} as the tool input.
+- Never emit a top-level `function_call` named `exec_command`. Shell runs only via nested JS: `await tools.exec_command({cmd, workdir})`.
+- Tool input must be raw JavaScript source (optionally starting with `// @exec: {...}`), not JSON, not a quoted string, not markdown fences.
+- Correct: `await tools.exec_command({cmd: \"git status\", workdir: \"/path\"});`
+- Wrong: `{\"cmd\":\"git status\"}` as `exec` input, or `function_call`/`exec_command`.
+
+";
+
+/// Prepend hard rules so DeepSeek stops treating `exec` as shell `exec_command`.
+pub(crate) fn rewrite_exec_tool_description(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(|tools| tools.as_array_mut()) else {
+        return;
+    };
+    for tool in tools {
+        if tool.get("name").and_then(Value::as_str) != Some("exec") {
+            continue;
+        }
+        let Some(description) = tool.get("description").and_then(Value::as_str) else {
+            continue;
+        };
+        if description.starts_with("HARD RULES for `exec`") {
+            continue;
+        }
+        tool["description"] = Value::String(format!("{EXEC_DESCRIPTION_PREFIX}{description}"));
+    }
+}
+
+/// Fix DeepSeek misuse: `function_call`/`exec_command` and JSON `exec` inputs → JS `custom_tool_call`.
+pub(crate) fn normalize_exec_tool_calls(body: &mut Value) {
+    if let Some(item) = body.get_mut("item") {
+        normalize_exec_tool_item(item);
+    }
+    normalize_exec_in_output(body);
+    if let Some(response) = body.get_mut("response") {
+        normalize_exec_in_output(response);
+    }
+    normalize_exec_stream_event(body);
+}
+
+fn normalize_exec_in_output(value: &mut Value) {
+    let Some(output) = value
+        .get_mut("output")
+        .and_then(|output| output.as_array_mut())
+    else {
+        return;
+    };
+    for item in output {
+        normalize_exec_tool_item(item);
+    }
+}
+
+fn normalize_exec_tool_item(item: &mut Value) {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+
+    if item_type == "function_call" && name == "exec_command" {
+        let args = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}")
+            .to_string();
+        let input = wrap_exec_command_js(&args);
+        let Some(object) = item.as_object_mut() else {
+            return;
+        };
+        object.insert("type".to_string(), Value::String("custom_tool_call".to_string()));
+        object.insert("name".to_string(), Value::String("exec".to_string()));
+        object.insert("input".to_string(), Value::String(input));
+        object.remove("arguments");
+        return;
+    }
+
+    if item_type == "custom_tool_call" && name == "exec" {
+        let Some(input) = item.get("input").and_then(Value::as_str) else {
+            return;
+        };
+        if looks_like_exec_command_json(input) {
+            let wrapped = wrap_exec_command_js(input);
+            item["input"] = Value::String(wrapped);
+        }
+    }
+}
+
+fn normalize_exec_stream_event(body: &mut Value) {
+    let Some(event_type) = body.get("type").and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+
+    match event_type.as_str() {
+        "response.function_call_arguments.done" => {
+            let Some(args) = body
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            if !looks_like_exec_command_json(&args) {
+                return;
+            }
+            let input = wrap_exec_command_js(&args);
+            let Some(object) = body.as_object_mut() else {
+                return;
+            };
+            object.insert(
+                "type".to_string(),
+                Value::String("response.custom_tool_call_input.done".to_string()),
+            );
+            object.insert("input".to_string(), Value::String(input));
+            object.remove("arguments");
+        }
+        "response.custom_tool_call_input.done" => {
+            let Some(input) = body
+                .get("input")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            if looks_like_exec_command_json(&input) {
+                body["input"] = Value::String(wrap_exec_command_js(&input));
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn looks_like_exec_command_json(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    value
+        .get("cmd")
+        .and_then(Value::as_str)
+        .is_some_and(|cmd| !cmd.is_empty())
+}
+
+pub(crate) fn wrap_exec_command_js(args_json: &str) -> String {
+    let trimmed = args_json.trim();
+    if trimmed.starts_with("await tools.exec_command") {
+        return trimmed.to_string();
+    }
+    let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"{}\"".to_string());
+    format!("await tools.exec_command(JSON.parse({literal}));")
+}

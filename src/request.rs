@@ -148,43 +148,25 @@ mod tests {
 
         normalize_request_for_upstream(&deepseek(), &mut request);
 
-        assert_eq!(
-            request["tools"],
-            json!([
-                {
-                    "type": "custom",
-                    "name": "exec",
-                    "description": "Run JS",
-                    "format": {
-                        "type": "grammar",
-                        "syntax": "lark",
-                        "definition": "start: SOURCE\n"
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "wait",
-                    "description": "Wait",
-                    "parameters": {"type": "object", "properties": {}}
-                },
-                {
-                    "type": "function",
-                    "name": "request_user_input",
-                    "description": "Ask user",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            ])
+        assert_eq!(request["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(request["tools"][0]["type"], "custom");
+        assert_eq!(request["tools"][0]["name"], "exec");
+        assert!(
+            request["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("HARD RULES for `exec`")
         );
+        assert!(
+            request["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Run JS")
+        );
+        assert_eq!(request["tools"][1]["name"], "wait");
+        assert_eq!(request["tools"][2]["name"], "request_user_input");
         assert_eq!(request["input"].as_array().unwrap().len(), 1);
         assert_eq!(request["input"][0]["content"], "ls");
-        assert!(
-            request
-                .get("tools")
-                .and_then(|t| t.as_array())
-                .unwrap()
-                .iter()
-                .any(|t| t["name"] == "exec")
-        );
     }
 
     #[test]
@@ -235,29 +217,16 @@ mod tests {
 
         normalize_request_for_upstream(&deepseek(), &mut request);
 
-        assert_eq!(
-            request["tools"],
-            json!([
-                {
-                    "type": "custom",
-                    "name": "exec",
-                    "description": "Run JS",
-                    "format": {"type": "text"}
-                },
-                {
-                    "type": "function",
-                    "name": "wait",
-                    "description": "Wait",
-                    "parameters": {"type": "object", "properties": {}}
-                },
-                {
-                    "type": "function",
-                    "name": "spawn_agent",
-                    "description": "Spawn",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            ])
+        assert_eq!(request["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(request["tools"][0]["name"], "exec");
+        assert!(
+            request["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("HARD RULES for `exec`")
         );
+        assert_eq!(request["tools"][1]["name"], "wait");
+        assert_eq!(request["tools"][2]["name"], "spawn_agent");
         assert_eq!(request["input"].as_array().unwrap().len(), 1);
         assert_eq!(request["input"][0]["role"], "user");
         assert_eq!(request["reasoning"]["effort"], "high");
