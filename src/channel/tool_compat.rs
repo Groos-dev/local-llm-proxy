@@ -183,10 +183,8 @@ fn strip_reasoning_content_from_item(item: &mut Value) {
         item.get("type").and_then(|value| value.as_str()),
         Some("function_call" | "custom_tool_call")
     );
-    if is_tool_call {
-        if let Some(object) = item.as_object_mut() {
-            object.remove("reasoning_content");
-        }
+    if is_tool_call && let Some(object) = item.as_object_mut() {
+        object.remove("reasoning_content");
     }
 }
 
@@ -363,9 +361,7 @@ pub(crate) fn looks_like_apply_patch_args(raw: &str) -> bool {
     value
         .get("input")
         .and_then(Value::as_str)
-        .is_some_and(|input| {
-            input.contains("*** Begin Patch") || input.contains("*** Update File")
-        })
+        .is_some_and(|input| input.contains("*** Begin Patch") || input.contains("*** Update File"))
 }
 
 pub(crate) fn wrap_exec_command_js(args_json: &str) -> String {
@@ -388,10 +384,10 @@ pub(crate) fn wrap_apply_patch_js(args: &str) -> String {
 }
 
 fn extract_apply_patch_text(raw: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        if let Some(input) = value.get("input").and_then(Value::as_str) {
-            return input.to_string();
-        }
+    if let Ok(value) = serde_json::from_str::<Value>(raw)
+        && let Some(input) = value.get("input").and_then(Value::as_str)
+    {
+        return input.to_string();
     }
     if let Ok(as_string) = serde_json::from_str::<String>(raw) {
         return as_string;

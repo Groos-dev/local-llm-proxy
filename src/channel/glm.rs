@@ -1,7 +1,7 @@
 use super::UpstreamChannel;
 use super::tool_compat::{
-    promote_additional_tools, rewrite_exec_tool_description, serialize_parallel_tool_calls,
-    normalize_exec_tool_calls, strip_tool_call_reasoning_content,
+    normalize_exec_tool_calls, promote_additional_tools, rewrite_exec_tool_description,
+    serialize_parallel_tool_calls, strip_tool_call_reasoning_content,
 };
 use serde_json::Value;
 

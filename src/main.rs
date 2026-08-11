@@ -482,6 +482,9 @@ fn stream_response(
     let source = upstream.bytes_stream();
     let response_headers = headers.clone();
     let public_model = route.public_model.clone();
+    if let Some(exchange) = exchange.as_ref() {
+        exchange.note_sse_headers(&response_headers);
+    }
     let output = stream! {
         let mut restorer = SseModelRestorer::default();
         let mut raw = Vec::new();
@@ -490,6 +493,9 @@ fn stream_response(
             match chunk {
                 Ok(chunk) => {
                     raw.extend_from_slice(&chunk);
+                    if let Some(exchange) = exchange.as_ref() {
+                        exchange.append_sse_chunk(&chunk);
+                    }
                     for event in restorer.push(&chunk, &route) {
                         yield Ok::<Bytes, Infallible>(Bytes::from(event));
                     }
