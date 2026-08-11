@@ -1,9 +1,7 @@
-use crate::channel::tool_compat::{
-    nested_fn_rewrite_for_name, wrap_nested_fn_js, NestedFnRewrite,
-};
+use crate::ChannelKind;
+use crate::channel::tool_compat::{NestedFnRewrite, nested_fn_rewrite_for_name, wrap_nested_fn_js};
 use crate::model::ModelRoute;
 use crate::response::normalize_response_for_client;
-use crate::ChannelKind;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -151,10 +149,7 @@ fn track_nested_fn_item(body: &Value, restorer: &mut SseModelRestorer) {
     }
 }
 
-fn nested_fn_sse_action(
-    body: &mut Value,
-    restorer: &mut SseModelRestorer,
-) -> Option<SseAction> {
+fn nested_fn_sse_action(body: &mut Value, restorer: &mut SseModelRestorer) -> Option<SseAction> {
     let event_type = body.get("type").and_then(Value::as_str)?;
     let item_id = body.get("item_id").and_then(Value::as_str)?.to_string();
     let kind = *restorer.nested_fn_ids.get(&item_id)?;
