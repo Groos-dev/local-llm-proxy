@@ -1,0 +1,42 @@
+src/exchange.rs
+  s_20703447da3dcc::t_dd5920198edf19 131-136
+  s_20703447da3dcc::t_03970a290b7dde 4-5,7,13-15,22-24,60-79,89,91-92,94-106,109,116,120-130,137-158,160-161,163-170,176-180,182,191-214,265-271,278-306,308-327,329-339,341-359
+  s_20703447da3dcc::t_4946a3d8c79f28 272-277
+  s_20703447da3dcc::t_1347e274d40e9d 90,93
+  s_20703447da3dcc::t_574a8fa20746ad 159,162,181,183-190
+  s_20703447da3dcc::t_94d17e6479c960 340
+src/channel/glm.rs
+  s_0841e20ebe5b84::t_0b7248c1979ce8 3-4
+src/sse.rs
+  s_0841e20ebe5b84::t_0b7248c1979ce8 1-2,152
+src/main.rs
+  s_20703447da3dcc::t_e5a95f4266b76b 485-487,496-498
+src/channel/tool_compat.rs
+  s_20703447da3dcc::t_3e42e1cb0d0783 187
+  s_0841e20ebe5b84::t_0b7248c1979ce8 186
+  s_20703447da3dcc::t_0989ca53694b8c 387-390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.39-trip",
+  "base_commit_sha": "703dd41bc9244f5a472dae3d4bc4335ce6a57561",
+  "prompts": {},
+  "sessions": {
+    "s_0841e20ebe5b84": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "44970504-8297-4bbe-b671-89f5082ba2ef",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    },
+    "s_20703447da3dcc": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "61008acb-4ac1-4293-91a9-360b789f3875",
+        "model": "default"
+      },
+      "human_author": "groos <gegu926@gmail.com>"
+    }
+  }
+}
