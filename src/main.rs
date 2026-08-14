@@ -10,8 +10,9 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use local_llm_proxy::{
-    AppConfig, ExchangeLog, ModelRoute, ProviderRegistry, SseModelRestorer,
+    AppConfig, ExchangeLog, ModelRoute, ProviderRegistry, SseMessageRestorer, SseModelRestorer,
     build_model_fallback_request, compact_response_from_model_response,
+    normalize_message_request_for_upstream, normalize_message_response_for_client,
     normalize_request_for_upstream, normalize_response_for_client, rewrite_request_model,
 };
 use serde::Deserialize;
@@ -64,6 +65,7 @@ async fn main() {
     };
     let app = Router::new()
         .route("/v1/models", get(models))
+        .route("/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
         .route("/v1/admin/active-provider", get(get_active_provider))
@@ -129,6 +131,93 @@ async fn models(State(state): State<AppState>) -> Response {
             .public_models_list(&active_provider_name(&state)),
         Some("application/json"),
         true,
+    )
+}
+
+async fn messages(State(state): State<AppState>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid request body"),
+    };
+    let client_request: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "request body must be JSON"),
+    };
+    let Some(model) = client_request.get("model").and_then(Value::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "unsupported model");
+    };
+    let Some(route) = route_for_active_model(&state, model) else {
+        return error_response(StatusCode::BAD_REQUEST, "unsupported model");
+    };
+    let mut payload = client_request.clone();
+    normalize_message_request_for_upstream(&route, &mut payload);
+    let exchange = ExchangeLog::begin(
+        &state.exchange_log_dir,
+        &headers,
+        &client_request,
+        &payload,
+        &route.public_model,
+    );
+
+    let mut upstream = state
+        .client
+        .post(format!("{}/messages", route.upstream_base_url))
+        .bearer_auth(&route.api_key)
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&payload);
+    upstream = forward_request_headers(upstream, &headers);
+
+    let upstream = match upstream.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            eprintln!("upstream messages request failed: {err}");
+            exchange.finish_text(
+                502,
+                "text/plain",
+                err.to_string().as_bytes(),
+                &HeaderMap::new(),
+            );
+            return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+        }
+    };
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let response_headers = upstream.headers().clone();
+    let content_type = response_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    if !status.is_success() {
+        let bytes = upstream.bytes().await.unwrap_or_default();
+        eprintln!(
+            "upstream messages status={status} body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+        exchange.finish_text(status.as_u16(), &content_type, &bytes, &response_headers);
+        return raw_response(status, bytes, &content_type, None, &response_headers);
+    }
+    if content_type.starts_with("text/event-stream") {
+        return message_stream_response(upstream, route, &response_headers, Some(exchange));
+    }
+
+    let bytes = upstream.bytes().await.unwrap_or_default();
+    exchange.finish_text(status.as_u16(), &content_type, &bytes, &response_headers);
+    let body = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(mut body) => {
+            normalize_message_response_for_client(&route, &mut body);
+            Bytes::from(serde_json::to_vec(&body).unwrap())
+        }
+        Err(_) => bytes,
+    };
+    raw_response(
+        status,
+        body,
+        &content_type,
+        Some(route.public_model.as_str()),
+        &response_headers,
     )
 }
 
@@ -471,6 +560,52 @@ fn forward_request_headers(
         request = request.header(name, value);
     }
     request
+}
+
+fn message_stream_response(
+    upstream: reqwest::Response,
+    route: ModelRoute,
+    headers: &HeaderMap,
+    exchange: Option<ExchangeLog>,
+) -> Response {
+    let source = upstream.bytes_stream();
+    let response_headers = headers.clone();
+    let public_model = route.public_model.clone();
+    if let Some(exchange) = exchange.as_ref() {
+        exchange.note_sse_headers(&response_headers);
+    }
+    let output = stream! {
+        let mut restorer = SseMessageRestorer::default();
+        let mut raw = Vec::new();
+        futures_util::pin_mut!(source);
+        while let Some(chunk) = source.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    raw.extend_from_slice(&chunk);
+                    if let Some(exchange) = exchange.as_ref() {
+                        exchange.append_sse_chunk(&chunk);
+                    }
+                    for event in restorer.push(&chunk, &route) {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(event));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if let Some(event) = restorer.finish(&route) {
+            yield Ok(Bytes::from(event));
+        }
+        if let Some(exchange) = exchange {
+            exchange.finish_text(200, "text/event-stream", &raw, &response_headers);
+        }
+    };
+    raw_response(
+        StatusCode::OK,
+        Body::from_stream(output),
+        "text/event-stream",
+        Some(public_model.as_str()),
+        headers,
+    )
 }
 
 fn stream_response(
