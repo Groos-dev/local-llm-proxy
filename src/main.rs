@@ -2,44 +2,48 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::Response,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 use local_llm_proxy::{
-    AppConfig, ExchangeLog, ModelRoute, ProviderRegistry, SseModelRestorer,
-    build_model_fallback_request, compact_response_from_model_response,
-    normalize_request_for_upstream, normalize_response_for_client, rewrite_request_model,
+    ExchangeLog, ModelRoute, ModelRouteConfig, PUBLIC_MODELS, ProviderCatalog, RouteTable,
+    SseModelRestorer, normalize_request_for_upstream, normalize_response_for_client, resolve_route,
+    rewrite_request_model,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{convert::Infallible, env, fs, net::SocketAddr, path::PathBuf, sync::Arc, sync::RwLock};
+use std::{
+    convert::Infallible,
+    env, fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
+const DEFAULT_ROUTES_PATH: &str = ".run/routes.json";
 const MODELS_ETAG: &str = "local-llm-proxy-v1";
 
 #[derive(Clone)]
 struct AppState {
     client: reqwest::Client,
-    registry: Arc<ProviderRegistry>,
-    active_provider: Arc<RwLock<String>>,
+    catalog: Arc<ProviderCatalog>,
+    routes: Arc<RwLock<RouteTable>>,
+    routes_path: PathBuf,
     exchange_log_dir: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetActiveProviderRequest {
-    provider: String,
 }
 
 #[tokio::main]
 async fn main() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let config_path = env::var_os("CONFIG_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_CONFIG_PATH));
-    let config = AppConfig::load(&config_path)
+        .unwrap_or_else(|| manifest_dir.join(DEFAULT_CONFIG_PATH));
+    let config = local_llm_proxy::AppConfig::load(&config_path)
         .unwrap_or_else(|err| panic!("failed to load {}: {err}", config_path.display()));
     let bind_addr = env::var("BIND_ADDR")
         .ok()
@@ -51,83 +55,171 @@ async fn main() {
         .ok()
         .or(config.exchange_log_dir.clone())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".run/exchanges"));
-    let registry = ProviderRegistry::new(config)
+        .unwrap_or_else(|| manifest_dir.join(".run/exchanges"));
+    let routes_path = env::var_os("ROUTES_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join(DEFAULT_ROUTES_PATH));
+
+    let catalog = ProviderCatalog::new(config)
         .unwrap_or_else(|err| panic!("invalid provider configuration: {err}"));
-    let active_provider = registry.default_provider().to_string();
+    let mut routes = RouteTable::load(&routes_path)
+        .unwrap_or_else(|err| panic!("failed to load {}: {err}", routes_path.display()));
+    let added = routes.ensure_default_self_routes(&catalog);
+    if added > 0 {
+        routes
+            .save(&routes_path)
+            .unwrap_or_else(|err| panic!("failed to save {}: {err}", routes_path.display()));
+        eprintln!(
+            "seeded {added} default self route(s) from {}",
+            catalog.default_provider()
+        );
+    }
     let _ = fs::create_dir_all(&exchange_log_dir);
+
     let state = AppState {
         client: reqwest::Client::new(),
-        active_provider: Arc::new(RwLock::new(active_provider)),
-        registry: Arc::new(registry),
+        catalog: Arc::new(catalog),
+        routes: Arc::new(RwLock::new(routes)),
+        routes_path,
         exchange_log_dir,
     };
+
     let app = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
-        .route("/v1/admin/active-provider", get(get_active_provider))
-        .route("/v1/admin/active-provider", put(put_active_provider))
+        .route("/compact", post(compact))
+        .route("/v1/admin/providers", get(providers))
+        .route("/v1/admin/routes", get(get_routes))
+        .route("/v1/admin/routes/{model}", put(put_route))
+        .route("/v1/admin/routes/{model}", delete(delete_route))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-fn active_provider_name(state: &AppState) -> String {
-    state
-        .active_provider
-        .read()
-        .expect("active_provider lock")
-        .clone()
+fn route_for_model(state: &AppState, model: &str) -> Option<ModelRoute> {
+    let routes = state.routes.read().expect("routes lock");
+    resolve_route(&state.catalog, &routes, model)
 }
 
-fn active_provider_body(state: &AppState) -> Value {
-    json!({
-        "provider": active_provider_name(state),
-        "providers": state.registry.provider_names(),
-    })
+async fn providers(State(state): State<AppState>) -> Response {
+    let data: Vec<Value> = state
+        .catalog
+        .provider_names()
+        .iter()
+        .filter_map(|name| state.catalog.get(name))
+        .map(|provider| {
+            json!({
+                "name": provider.name,
+                "base_url": provider.base_url,
+                "supports_compact": provider.supports_compact,
+                "models": provider.model_order.iter().map(|upstream| {
+                    json!({
+                        "upstream_model": upstream,
+                        "response_adapter": provider.adapter_for(upstream),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json_response(StatusCode::OK, json!({ "providers": data }), true)
 }
 
-fn route_for_active_model(state: &AppState, model: &str) -> Option<ModelRoute> {
-    state
-        .registry
-        .route_for_public_model(&active_provider_name(state), model)
-}
-
-async fn get_active_provider(State(state): State<AppState>) -> Response {
-    json_response(
-        StatusCode::OK,
-        active_provider_body(&state),
-        Some("application/json"),
-        false,
-    )
-}
-
-async fn put_active_provider(
-    State(state): State<AppState>,
-    Json(body): Json<SetActiveProviderRequest>,
-) -> Response {
-    let provider = body.provider.trim();
-    if provider.is_empty() || !state.registry.has_provider(provider) {
-        return error_response(StatusCode::BAD_REQUEST, "unknown provider");
+async fn get_routes(State(state): State<AppState>) -> Response {
+    let routes = state.routes.read().expect("routes lock");
+    let mut data = serde_json::Map::new();
+    for model in PUBLIC_MODELS {
+        if let Some(route) = routes.get(model) {
+            data.insert(model.to_string(), json!(route));
+        }
     }
-    *state.active_provider.write().expect("active_provider lock") = provider.to_string();
-    json_response(
-        StatusCode::OK,
-        active_provider_body(&state),
-        Some("application/json"),
-        false,
-    )
+    json_response(StatusCode::OK, json!({ "routes": data }), true)
+}
+
+#[derive(Debug, Deserialize)]
+struct SetRouteRequest {
+    provider: String,
+    upstream_model: String,
+}
+
+async fn put_route(
+    State(state): State<AppState>,
+    Path(model): Path<String>,
+    Json(body): Json<SetRouteRequest>,
+) -> Response {
+    if !PUBLIC_MODELS.contains(&model.as_str()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("unsupported public model '{model}'"),
+        );
+    }
+    if body.upstream_model.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "upstream_model must not be empty");
+    }
+    if !state
+        .catalog
+        .supports_model(&body.provider, &body.upstream_model)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "provider does not support this upstream_model",
+        );
+    }
+
+    let mut routes = state.routes.write().expect("routes lock");
+    routes.set(
+        model,
+        ModelRouteConfig {
+            provider: body.provider,
+            upstream_model: body.upstream_model,
+        },
+    );
+    if let Err(err) = routes.save(&state.routes_path) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+    }
+    routes_response(StatusCode::OK, &routes)
+}
+
+async fn delete_route(State(state): State<AppState>, Path(model): Path<String>) -> Response {
+    let mut routes = state.routes.write().expect("routes lock");
+    if !routes.remove(&model) {
+        return error_response(StatusCode::NOT_FOUND, "route not found");
+    }
+    if let Err(err) = routes.save(&state.routes_path) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+    }
+    routes_response(StatusCode::OK, &routes)
+}
+
+fn routes_response(status: StatusCode, routes: &RouteTable) -> Response {
+    let mut data = serde_json::Map::new();
+    for model in PUBLIC_MODELS {
+        if let Some(route) = routes.get(model) {
+            data.insert(model.to_string(), json!(route));
+        }
+    }
+    json_response(status, json!({ "routes": data }), true)
 }
 
 async fn models(State(state): State<AppState>) -> Response {
+    let routes = state.routes.read().expect("routes lock");
+    let data: Vec<Value> = PUBLIC_MODELS
+        .iter()
+        .filter(|model| routes.get(model).is_some())
+        .map(|model| {
+            json!({
+                "id": model,
+                "object": "model",
+                "created": 1_700_000_000i64,
+                "owned_by": "local-llm-proxy",
+            })
+        })
+        .collect();
     json_response(
         StatusCode::OK,
-        state
-            .registry
-            .public_models_list(&active_provider_name(&state)),
-        Some("application/json"),
+        json!({ "object": "list", "data": data }),
         true,
     )
 }
@@ -145,7 +237,7 @@ async fn responses(State(state): State<AppState>, request: Request) -> Response 
     let Some(model) = codex_request.get("model").and_then(Value::as_str) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
-    let Some(route) = route_for_active_model(&state, model) else {
+    let Some(route) = route_for_model(&state, model) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
     let mut payload = codex_request.clone();
@@ -233,7 +325,7 @@ async fn compact(State(state): State<AppState>, request: Request) -> Response {
     let Some(model) = codex_request.get("model").and_then(Value::as_str) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
-    let Some(route) = route_for_active_model(&state, model) else {
+    let Some(route) = route_for_model(&state, model) else {
         return error_response(StatusCode::BAD_REQUEST, "unsupported model");
     };
     let mut payload = codex_request;
@@ -241,15 +333,7 @@ async fn compact(State(state): State<AppState>, request: Request) -> Response {
     normalize_request_for_upstream(&route, &mut payload);
 
     if !route.supports_compact {
-        return compact_unavailable_response(
-            &state,
-            &headers,
-            &route,
-            &payload,
-            "provider compact is disabled",
-            None,
-        )
-        .await;
+        return error_response(StatusCode::NOT_FOUND, "provider does not support compact");
     }
 
     let mut upstream = state
@@ -264,15 +348,7 @@ async fn compact(State(state): State<AppState>, request: Request) -> Response {
         Ok(response) => response,
         Err(err) => {
             eprintln!("upstream compact request failed: {err}");
-            return compact_unavailable_response(
-                &state,
-                &headers,
-                &route,
-                &payload,
-                "upstream compact request failed",
-                None,
-            )
-            .await;
+            return error_response(StatusCode::BAD_GATEWAY, "upstream compact request failed");
         }
     };
     let status =
@@ -285,28 +361,12 @@ async fn compact(State(state): State<AppState>, request: Request) -> Response {
         .to_string();
     let bytes = upstream.bytes().await.unwrap_or_default();
 
-    if status == StatusCode::NOT_FOUND {
-        eprintln!("upstream compact returned 404");
-        return compact_unavailable_response(
-            &state,
-            &headers,
-            &route,
-            &payload,
-            "upstream compact not found",
-            Some((status, bytes, content_type, response_headers)),
-        )
-        .await;
-    }
     if !status.is_success() {
-        return compact_unavailable_response(
-            &state,
-            &headers,
-            &route,
-            &payload,
-            "upstream compact failed",
-            Some((status, bytes, content_type, response_headers)),
-        )
-        .await;
+        eprintln!(
+            "upstream compact status={status} body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+        return raw_response(status, bytes, &content_type, None, &response_headers);
     }
 
     let body = match serde_json::from_slice::<Value>(&bytes) {
@@ -314,22 +374,7 @@ async fn compact(State(state): State<AppState>, request: Request) -> Response {
             normalize_response_for_client(&route, &mut body);
             Bytes::from(serde_json::to_vec(&body).unwrap())
         }
-        Err(_) => {
-            return compact_unavailable_response(
-                &state,
-                &headers,
-                &route,
-                &payload,
-                "upstream compact returned invalid JSON",
-                Some((
-                    StatusCode::BAD_GATEWAY,
-                    bytes,
-                    content_type,
-                    response_headers,
-                )),
-            )
-            .await;
-        }
+        Err(_) => bytes,
     };
     raw_response(
         status,
@@ -338,119 +383,6 @@ async fn compact(State(state): State<AppState>, request: Request) -> Response {
         Some(route.public_model.as_str()),
         &response_headers,
     )
-}
-
-async fn compact_unavailable_response(
-    state: &AppState,
-    request_headers: &HeaderMap,
-    route: &ModelRoute,
-    payload: &Value,
-    message: &str,
-    upstream: Option<(StatusCode, Bytes, String, HeaderMap)>,
-) -> Response {
-    if let Some(response) = model_compact_fallback(state, request_headers, route, payload).await {
-        eprintln!("using model compact fallback for {}", route.public_model);
-        return response;
-    }
-    if let Some((status, body, content_type, headers)) = upstream {
-        return raw_response(status, body, &content_type, None, &headers);
-    }
-    error_response(StatusCode::BAD_GATEWAY, message)
-}
-
-async fn model_compact_fallback(
-    state: &AppState,
-    request_headers: &HeaderMap,
-    route: &ModelRoute,
-    payload: &Value,
-) -> Option<Response> {
-    let mut fallback_payload = build_model_fallback_request(route, payload);
-    normalize_request_for_upstream(route, &mut fallback_payload);
-    let mut request = state
-        .client
-        .post(format!("{}/responses", route.upstream_base_url))
-        .bearer_auth(&route.api_key)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&fallback_payload);
-    request = forward_request_headers(request, request_headers);
-
-    let upstream = match request.send().await {
-        Ok(response) => response,
-        Err(err) => {
-            eprintln!("model compact fallback request failed: {err}");
-            return None;
-        }
-    };
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let response_headers = upstream.headers().clone();
-    let content_type = response_headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let bytes = upstream.bytes().await.ok()?;
-    if !status.is_success() {
-        eprintln!(
-            "model compact fallback returned status={status} body={}",
-            String::from_utf8_lossy(&bytes)
-        );
-        return None;
-    }
-
-    let mut model_response = if content_type.starts_with("text/event-stream") {
-        collect_streamed_model_response(route, &bytes)?
-    } else {
-        serde_json::from_slice::<Value>(&bytes).ok()?
-    };
-    normalize_response_for_client(route, &mut model_response);
-    let compact_response = compact_response_from_model_response(route, model_response)?;
-    Some(raw_response(
-        StatusCode::OK,
-        Bytes::from(serde_json::to_vec(&compact_response).ok()?),
-        "application/json",
-        Some(route.public_model.as_str()),
-        &response_headers,
-    ))
-}
-
-fn collect_streamed_model_response(route: &ModelRoute, bytes: &[u8]) -> Option<Value> {
-    let mut restorer = SseModelRestorer::default();
-    let mut events = restorer.push(bytes, route);
-    if let Some(event) = restorer.finish(route) {
-        events.push(event);
-    }
-
-    let mut output_items = Vec::new();
-    let mut completed_output = None;
-    for event in events {
-        let text = std::str::from_utf8(&event).ok()?;
-        for line in text.lines() {
-            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                continue;
-            };
-            if data == "[DONE]" {
-                continue;
-            }
-            let body = serde_json::from_str::<Value>(data).ok()?;
-            match body.get("type").and_then(Value::as_str) {
-                Some("response.output_item.done") => {
-                    if let Some(item) = body.get("item") {
-                        output_items.push(item.clone());
-                    }
-                }
-                Some("response.completed") => {
-                    completed_output = body
-                        .pointer("/response/output")
-                        .and_then(Value::as_array)
-                        .cloned();
-                }
-                _ => {}
-            }
-        }
-    }
-    let output = completed_output.or_else(|| (!output_items.is_empty()).then_some(output_items))?;
-    Some(json!({"output": output}))
 }
 
 fn forward_request_headers(
@@ -523,21 +455,15 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     json_response(
         status,
         json!({ "error": { "message": message, "type": "invalid_request_error" } }),
-        Some("application/json"),
         false,
     )
 }
 
-fn json_response(
-    status: StatusCode,
-    body: Value,
-    content_type: Option<&str>,
-    models_etag: bool,
-) -> Response {
+fn json_response(status: StatusCode, body: Value, models_etag: bool) -> Response {
     raw_response(
         status,
         Bytes::from(serde_json::to_vec(&body).unwrap()),
-        content_type.unwrap_or("application/json"),
+        "application/json",
         models_etag.then_some(""),
         &HeaderMap::new(),
     )
@@ -569,7 +495,6 @@ fn raw_response<B: Into<Body>>(
             .headers_mut()
             .insert(HeaderName::from_static("openai-model"), value);
     }
-    // TODO 这些header 一定会有吗，回写有什么作用, 影响codex工作吗
     for name in [
         "request-id",
         "x-request-id",
@@ -583,37 +508,4 @@ fn raw_response<B: Into<Body>>(
         }
     }
     response
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use local_llm_proxy::ChannelKind;
-
-    #[test]
-    fn collects_streamed_model_output_for_compact_response() {
-        let route = ModelRoute {
-            origin_model: "upstream-model".to_string(),
-            public_model: "public-model".to_string(),
-            provider_name: "provider".to_string(),
-            upstream_base_url: "https://example.com/v1".to_string(),
-            api_key: "secret".to_string(),
-            channel: ChannelKind::DeepSeek,
-            supports_compact: false,
-        };
-        let stream = concat!(
-            "event: response.output_item.done\n",
-            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"summary\"}]}}\n\n",
-            "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"upstream-model\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"summary\"}]}]}}\n\n",
-            "data: [DONE]\n\n"
-        );
-
-        let response = collect_streamed_model_response(&route, stream.as_bytes()).unwrap();
-        let compact = compact_response_from_model_response(&route, response).unwrap();
-
-        assert_eq!(compact["model"], "public-model");
-        assert_eq!(compact["output"][0]["role"], "assistant");
-        assert_eq!(compact["output"][0]["content"][0]["text"], "summary");
-    }
 }
