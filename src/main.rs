@@ -249,6 +249,8 @@ async fn responses(State(state): State<AppState>, request: Request) -> Response 
         &codex_request,
         &payload,
         &route.public_model,
+        &route.provider_name,
+        &route.origin_model,
     );
 
     let mut upstream = state
