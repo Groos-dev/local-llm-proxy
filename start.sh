@@ -42,6 +42,7 @@ mkdir -p "$RUN_DIR/exchanges"
 cargo build -q
 
 export EXCHANGE_LOG_DIR="${EXCHANGE_LOG_DIR:-$RUN_DIR/exchanges}"
+export ROUTES_PATH="${ROUTES_PATH:-$RUN_DIR/routes.json}"
 nohup "$ROOT/target/debug/local-llm-proxy" >"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
 

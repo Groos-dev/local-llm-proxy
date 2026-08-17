@@ -7,6 +7,7 @@ edition = "2024"
 async-stream = "=0.3.6"
 axum = "=0.8.9"
 bytes = "=1.11.1"
+dialoguer = "=0.12.0"
 futures-util = "=0.3.32"
 reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "=1.0.228", features = ["derive"] }
