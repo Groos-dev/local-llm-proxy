@@ -9,7 +9,7 @@ use std::{
     path::Path,
 };
 
-/// 对外固定暴露的公开模型名。只有这三个名字会被 /v1/models 和请求路由接受。
+/// Public model names exposed externally. Only these three names are accepted by /v1/models and request routing.
 pub const PUBLIC_MODELS: [&str; 3] = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
 
 #[derive(Clone, Debug, Deserialize)]
@@ -22,8 +22,8 @@ pub struct AppConfig {
     pub providers: Vec<ProviderConfig>,
 }
 
-/// 静态 provider 定义：连接信息 + 支持哪些 upstream 模型及其 adapter + 是否支持 compact。
-/// 模型到 provider 的动态路由不在此处。
+/// Static provider definition: connection info, supported upstream models and their adapters, and whether compact is supported.
+/// Dynamic model-to-provider routing lives elsewhere.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
@@ -60,14 +60,14 @@ impl Provider {
     }
 }
 
-/// 单个动态路由：公开模型 -> provider + 上游模型。
+/// A single dynamic route: public model -> provider + upstream model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelRouteConfig {
     pub provider: String,
     pub upstream_model: String,
 }
 
-/// 运行时可调整的路由表，持久化到 JSON。静态 provider 目录与其完全解耦。
+/// Runtime-adjustable route table persisted to JSON, fully decoupled from the static provider catalog.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RouteTable {
     pub routes: HashMap<String, ModelRouteConfig>,
@@ -136,9 +136,9 @@ impl RouteTable {
         self.routes.remove(public_model).is_some()
     }
 
-    /// 启动默认映射：对固定公开模型做“同名直通补缺”。
-    /// 仅当 public model 尚无显式路由，且 default provider 声明了同名 upstream model 时，
-    /// 建立 public_model -> default_provider/public_model 的 self 路由。已有路由不受影响。
+    /// Startup default mapping: fill in same-name passthrough routes for the fixed public models.
+    /// Only when a public model has no explicit route and the default provider declares a same-name upstream model,
+    /// create a public_model -> default_provider/public_model self route. Existing routes are untouched.
     pub fn ensure_default_self_routes(&mut self, catalog: &ProviderCatalog) -> usize {
         let default_provider = catalog.default_provider();
         let mut added = 0;
@@ -291,7 +291,7 @@ impl ProviderCatalog {
     }
 }
 
-/// 将动态路由与静态 provider 目录解析为可转发的 ModelRoute。
+/// Resolve a dynamic route against the static provider catalog into a forwardable ModelRoute.
 pub fn resolve_route(
     catalog: &ProviderCatalog,
     table: &RouteTable,
@@ -416,7 +416,7 @@ response_adapter = "standard"
 
         let added = table.ensure_default_self_routes(&catalog);
 
-        // luna 已有显式路由，不覆盖；terra/sol 是 default provider mmkg 的同名模型，补缺。
+        // luna already has an explicit route, so it is not overwritten; terra/sol are same-name models of default provider mmkg and get filled in.
         assert_eq!(added, 2);
         assert_eq!(table.get("gpt-5.6-luna").unwrap().provider, "ada");
         assert_eq!(
