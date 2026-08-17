@@ -40,6 +40,9 @@ rm -rf "$RUN_DIR/exchanges"
 mkdir -p "$RUN_DIR/exchanges"
 : >"$LOG_FILE"
 cargo build -q
+cargo build -q --bin llpx
+cp "$ROOT/target/debug/llpx" "$ROOT/llpx"
+chmod +x "$ROOT/llpx"
 
 export EXCHANGE_LOG_DIR="${EXCHANGE_LOG_DIR:-$RUN_DIR/exchanges}"
 export ROUTES_PATH="${ROUTES_PATH:-$RUN_DIR/routes.json}"
