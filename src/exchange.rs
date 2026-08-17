@@ -10,14 +10,16 @@ use std::{
 
 static EXCHANGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-const SSE_PARTIAL_NAME: &str = "ada_response.sse.partial";
-const SSE_FINAL_NAME: &str = "ada_response.sse";
+const SSE_PARTIAL_NAME: &str = "upstream_response.sse.partial";
+const SSE_FINAL_NAME: &str = "upstream_response.sse";
 
 pub struct ExchangeLog {
     dir: PathBuf,
     dir_name: String,
     request_id: String,
     public_model: String,
+    provider_name: String,
+    upstream_model: String,
     started_at_ms: u128,
     finished: AtomicBool,
     /// Captured when SSE streaming starts so Drop can still record request-id.
@@ -31,6 +33,8 @@ impl ExchangeLog {
         codex_request: &Value,
         upstream_request: &Value,
         public_model: &str,
+        provider_name: &str,
+        upstream_model: &str,
     ) -> Self {
         let request_id = client_request_id(headers);
         let started_at_ms = unix_ms();
@@ -47,15 +51,21 @@ impl ExchangeLog {
                 "request_id": request_id,
                 "exchange_dir": dir_name,
                 "public_model": public_model,
+                "provider": provider_name,
+                "upstream_model": upstream_model,
                 "started_at_ms": started_at_ms,
             }),
         );
-        eprintln!("exchange begin dir={dir_name} request_id={request_id} model={public_model}");
+        eprintln!(
+            "exchange begin dir={dir_name} request_id={request_id} model={public_model} provider={provider_name} upstream_model={upstream_model}"
+        );
         Self {
             dir,
             dir_name,
             request_id,
             public_model: public_model.to_string(),
+            provider_name: provider_name.to_string(),
+            upstream_model: upstream_model.to_string(),
             started_at_ms,
             finished: AtomicBool::new(false),
             sse_headers: std::sync::Mutex::new(None),
@@ -84,7 +94,7 @@ impl ExchangeLog {
         &self,
         status: u16,
         content_type: &str,
-        ada_response: &[u8],
+        upstream_response: &[u8],
         response_headers: &HeaderMap,
     ) {
         if self
@@ -94,39 +104,44 @@ impl ExchangeLog {
         {
             return;
         }
-        self.write_finished(status, content_type, ada_response, response_headers, false);
+        self.write_finished(
+            status,
+            content_type,
+            upstream_response,
+            response_headers,
+            false,
+        );
     }
 
     fn write_finished(
         &self,
         status: u16,
         content_type: &str,
-        ada_response: &[u8],
+        upstream_response: &[u8],
         response_headers: &HeaderMap,
         incomplete: bool,
     ) {
         let path = if content_type.starts_with("text/event-stream") {
             self.dir.join(SSE_FINAL_NAME)
         } else if content_type.contains("json") {
-            self.dir.join("ada_response.json")
+            self.dir.join("upstream_response.json")
         } else {
-            self.dir.join("ada_response.bin")
+            self.dir.join("upstream_response.bin")
         };
-        let _ = fs::write(&path, ada_response);
+        let _ = fs::write(&path, upstream_response);
         let _ = fs::remove_file(self.dir.join(SSE_PARTIAL_NAME));
-        let ada_request_id = header_str(response_headers, "request-id")
+        let upstream_request_id = header_str(response_headers, "request-id")
             .or_else(|| header_str(response_headers, "x-request-id"));
-        let has_dsml = String::from_utf8_lossy(ada_response).contains("DSML");
         let mut meta = json!({
             "request_id": self.request_id,
             "exchange_dir": self.dir_name,
             "public_model": self.public_model,
-            "ada_request_id": ada_request_id,
+            "provider": self.provider_name,
+            "upstream_model": self.upstream_model,
+            "upstream_request_id": upstream_request_id,
             "content_type": content_type,
-            "ada_response_bytes": ada_response.len(),
             "started_at_ms": self.started_at_ms,
             "finished_at_ms": unix_ms(),
-            "has_dsml": has_dsml,
         });
         if let Some(obj) = meta.as_object_mut() {
             if incomplete {
@@ -141,16 +156,15 @@ impl ExchangeLog {
                 "exchange incomplete dir={} request_id={} bytes={}",
                 self.dir_name,
                 self.request_id,
-                ada_response.len()
+                upstream_response.len()
             );
         } else {
             eprintln!(
-                "exchange done dir={} request_id={} status={} bytes={} dsml={}",
+                "exchange done dir={} request_id={} status={} bytes={}",
                 self.dir_name,
                 self.request_id,
                 status,
-                ada_response.len(),
-                has_dsml
+                upstream_response.len()
             );
         }
     }
@@ -171,10 +185,11 @@ impl ExchangeLog {
                 "request_id": self.request_id,
                 "exchange_dir": self.dir_name,
                 "public_model": self.public_model,
+                "provider": self.provider_name,
+                "upstream_model": self.upstream_model,
                 "started_at_ms": self.started_at_ms,
                 "finished_at_ms": unix_ms(),
                 "incomplete": true,
-                "ada_response_bytes": 0,
             });
             if let Ok(guard) = self.sse_headers.lock()
                 && let Some(headers) = guard.as_ref()
@@ -187,7 +202,7 @@ impl ExchangeLog {
                 if let Some(id) = header_str(headers, "request-id")
                     .or_else(|| header_str(headers, "x-request-id"))
                 {
-                    obj.insert("ada_request_id".to_string(), Value::String(id));
+                    obj.insert("upstream_request_id".to_string(), Value::String(id));
                 }
             }
             write_json(&self.dir.join("meta.json"), &meta);
@@ -288,6 +303,8 @@ mod tests {
             &json!({"model": "gpt"}),
             &json!({"model": "upstream"}),
             "gpt",
+            "test-provider",
+            "upstream",
         )
     }
 
@@ -299,7 +316,7 @@ mod tests {
         log.append_sse_chunk(b"event: x\ndata: 1\n\n");
         assert!(dir.join(SSE_PARTIAL_NAME).exists());
         let mut headers = HeaderMap::new();
-        headers.insert("request-id", HeaderValue::from_static("ada-1"));
+        headers.insert("request-id", HeaderValue::from_static("upstream-1"));
         log.finish_text(
             200,
             "text/event-stream",
@@ -322,7 +339,7 @@ mod tests {
             let log = begin_log(&root);
             let dir = log.dir.clone();
             let mut headers = HeaderMap::new();
-            headers.insert("request-id", HeaderValue::from_static("ada-drop"));
+            headers.insert("request-id", HeaderValue::from_static("upstream-drop"));
             log.note_sse_headers(&headers);
             log.append_sse_chunk(
                 b"event: response.output_item.done\ndata: {\"type\":\"message\"}\n\n",
@@ -338,7 +355,7 @@ mod tests {
             serde_json::from_slice(&fs::read(dir.join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["incomplete"], true);
         assert!(meta.get("status").is_none());
-        assert_eq!(meta["ada_request_id"], "ada-drop");
+        assert_eq!(meta["upstream_request_id"], "upstream-drop");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -355,7 +372,7 @@ mod tests {
             serde_json::from_slice(&fs::read(dir.join("meta.json")).unwrap()).unwrap();
         assert!(meta.get("incomplete").is_none());
         assert_eq!(meta["status"], 200);
-        assert!(dir.join("ada_response.json").exists());
+        assert!(dir.join("upstream_response.json").exists());
         let _ = fs::remove_dir_all(&root);
     }
 }
