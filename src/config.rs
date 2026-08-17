@@ -1,7 +1,6 @@
 use crate::channel::ChannelKind;
 use crate::model::ModelRoute;
-use serde::Deserialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -9,6 +8,9 @@ use std::{
     fs,
     path::Path,
 };
+
+/// 对外固定暴露的公开模型名。只有这三个名字会被 /v1/models 和请求路由接受。
+pub const PUBLIC_MODELS: [&str; 3] = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AppConfig {
@@ -20,6 +22,8 @@ pub struct AppConfig {
     pub providers: Vec<ProviderConfig>,
 }
 
+/// 静态 provider 定义：连接信息 + 支持哪些 upstream 模型及其 adapter + 是否支持 compact。
+/// 模型到 provider 的动态路由不在此处。
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
@@ -27,14 +31,46 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub supports_compact: bool,
     #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    pub models: Vec<ProviderModelConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct ModelConfig {
-    pub public_model: String,
+pub struct ProviderModelConfig {
     pub upstream_model: String,
     pub response_adapter: ChannelKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct Provider {
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub supports_compact: bool,
+    pub models: HashMap<String, ChannelKind>,
+    pub model_order: Vec<String>,
+}
+
+impl Provider {
+    pub fn adapter_for(&self, upstream_model: &str) -> Option<ChannelKind> {
+        self.models.get(upstream_model).copied()
+    }
+
+    pub fn supports_model(&self, upstream_model: &str) -> bool {
+        self.models.contains_key(upstream_model)
+    }
+}
+
+/// 单个动态路由：公开模型 -> provider + 上游模型。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelRouteConfig {
+    pub provider: String,
+    pub upstream_model: String,
+}
+
+/// 运行时可调整的路由表，持久化到 JSON。静态 provider 目录与其完全解耦。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RouteTable {
+    pub routes: HashMap<String, ModelRouteConfig>,
 }
 
 #[derive(Debug)]
@@ -64,20 +100,91 @@ impl AppConfig {
             .map_err(|err| ConfigError::new(format!("read {}: {err}", path.display())))?;
         Self::from_toml(&input)
     }
+}
 
-    fn validate(&self) -> Result<(), ConfigError> {
-        if self.providers.is_empty() {
+impl RouteTable {
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let input = fs::read_to_string(path)
+            .map_err(|err| ConfigError::new(format!("read {}: {err}", path.display())))?;
+        serde_json::from_str(&input)
+            .map_err(|err| ConfigError::new(format!("invalid route table: {err}")))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| ConfigError::new(format!("create {}: {err}", parent.display())))?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|err| ConfigError::new(format!("serialize route table: {err}")))?;
+        fs::write(path, bytes)
+            .map_err(|err| ConfigError::new(format!("write {}: {err}", path.display())))
+    }
+
+    pub fn get(&self, public_model: &str) -> Option<&ModelRouteConfig> {
+        self.routes.get(public_model)
+    }
+
+    pub fn set(&mut self, public_model: String, route: ModelRouteConfig) {
+        self.routes.insert(public_model, route);
+    }
+
+    pub fn remove(&mut self, public_model: &str) -> bool {
+        self.routes.remove(public_model).is_some()
+    }
+
+    /// 启动默认映射：对固定公开模型做“同名直通补缺”。
+    /// 仅当 public model 尚无显式路由，且 default provider 声明了同名 upstream model 时，
+    /// 建立 public_model -> default_provider/public_model 的 self 路由。已有路由不受影响。
+    pub fn ensure_default_self_routes(&mut self, catalog: &ProviderCatalog) -> usize {
+        let default_provider = catalog.default_provider();
+        let mut added = 0;
+        for public_model in PUBLIC_MODELS {
+            if self.routes.contains_key(public_model) {
+                continue;
+            }
+            if !catalog.supports_model(default_provider, public_model) {
+                continue;
+            }
+            self.routes.insert(
+                public_model.to_string(),
+                ModelRouteConfig {
+                    provider: default_provider.to_string(),
+                    upstream_model: public_model.to_string(),
+                },
+            );
+            added += 1;
+        }
+        added
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderCatalog {
+    providers: HashMap<String, Provider>,
+    provider_order: Vec<String>,
+    default_provider: String,
+}
+
+impl ProviderCatalog {
+    pub fn new(config: AppConfig) -> Result<Self, ConfigError> {
+        if config.providers.is_empty() {
             return Err(ConfigError::new(
                 "configuration must define at least one provider",
             ));
         }
 
-        let mut provider_names = HashSet::new();
-        for provider in &self.providers {
+        let mut providers = HashMap::new();
+        let mut provider_order = Vec::new();
+        let mut seen = HashSet::new();
+        for provider in config.providers {
             if provider.name.trim().is_empty() {
                 return Err(ConfigError::new("provider name must not be empty"));
             }
-            if !provider_names.insert(provider.name.as_str()) {
+            if !seen.insert(provider.name.clone()) {
                 return Err(ConfigError::new(format!(
                     "duplicate provider name '{}'",
                     provider.name
@@ -103,126 +210,105 @@ impl AppConfig {
             }
             if provider.models.is_empty() {
                 return Err(ConfigError::new(format!(
-                    "provider '{}' must define at least one model",
+                    "provider '{}' must declare at least one model",
                     provider.name
                 )));
             }
-            let mut public_models = HashSet::new();
-            for model in &provider.models {
-                if model.public_model.trim().is_empty() || model.upstream_model.trim().is_empty() {
+
+            let mut model_map = HashMap::new();
+            let mut model_order = Vec::new();
+            for model in provider.models {
+                let name = model.upstream_model.trim();
+                if name.is_empty() {
                     return Err(ConfigError::new(format!(
-                        "provider '{}' model names must not be empty",
+                        "provider '{}' upstream_model must not be empty",
                         provider.name
                     )));
                 }
-                if !public_models.insert(model.public_model.as_str()) {
+                if model_map
+                    .insert(name.to_string(), model.response_adapter)
+                    .is_some()
+                {
                     return Err(ConfigError::new(format!(
-                        "duplicate public model '{}' in provider '{}'",
-                        model.public_model, provider.name
+                        "provider '{}' declares duplicate upstream model '{}'",
+                        provider.name, name
                     )));
                 }
+                model_order.push(name.to_string());
             }
+
+            provider_order.push(provider.name.clone());
+            providers.insert(
+                provider.name.clone(),
+                Provider {
+                    name: provider.name,
+                    base_url: provider.base_url.trim_end_matches('/').to_string(),
+                    api_key: provider.api_key,
+                    supports_compact: provider.supports_compact,
+                    models: model_map,
+                    model_order,
+                },
+            );
         }
 
-        if self.default_provider.trim().is_empty() {
+        if config.default_provider.trim().is_empty() {
             return Err(ConfigError::new("default_provider must not be empty"));
         }
-        if !provider_names.contains(self.default_provider.as_str()) {
+        if !providers.contains_key(config.default_provider.as_str()) {
             return Err(ConfigError::new(format!(
                 "default_provider '{}' does not match any provider name",
-                self.default_provider
+                config.default_provider
             )));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ProviderRegistry {
-    routes: HashMap<String, HashMap<String, ModelRoute>>,
-    model_order: HashMap<String, Vec<String>>,
-    provider_names: Vec<String>,
-    default_provider: String,
-}
-
-impl ProviderRegistry {
-    pub fn new(config: AppConfig) -> Result<Self, ConfigError> {
-        config.validate()?;
-        let default_provider = config.default_provider;
-        let mut routes = HashMap::new();
-        let mut model_order = HashMap::new();
-        let mut provider_names = Vec::new();
-
-        for provider in config.providers {
-            let base_url = provider.base_url.trim_end_matches('/').to_string();
-            let mut provider_routes = HashMap::new();
-            let mut provider_models = Vec::new();
-            for model in provider.models {
-                let public_model = model.public_model.clone();
-                let route = ModelRoute {
-                    origin_model: model.upstream_model,
-                    public_model: public_model.clone(),
-                    provider_name: provider.name.clone(),
-                    upstream_base_url: base_url.clone(),
-                    api_key: provider.api_key.clone(),
-                    channel: model.response_adapter,
-                    supports_compact: provider.supports_compact,
-                };
-                provider_routes.insert(public_model.clone(), route);
-                provider_models.push(public_model);
-            }
-            provider_names.push(provider.name.clone());
-            routes.insert(provider.name.clone(), provider_routes);
-            model_order.insert(provider.name, provider_models);
         }
 
         Ok(Self {
-            routes,
-            model_order,
-            provider_names,
-            default_provider,
+            providers,
+            provider_order,
+            default_provider: config.default_provider,
         })
+    }
+
+    pub fn provider_names(&self) -> &[String] {
+        &self.provider_order
+    }
+
+    pub fn has_provider(&self, name: &str) -> bool {
+        self.providers.contains_key(name)
     }
 
     pub fn default_provider(&self) -> &str {
         &self.default_provider
     }
 
-    pub fn provider_names(&self) -> &[String] {
-        &self.provider_names
+    pub fn get(&self, name: &str) -> Option<&Provider> {
+        self.providers.get(name)
     }
 
-    pub fn has_provider(&self, provider: &str) -> bool {
-        self.routes.contains_key(provider)
+    pub fn supports_model(&self, provider: &str, upstream_model: &str) -> bool {
+        self.get(provider)
+            .map(|p| p.supports_model(upstream_model))
+            .unwrap_or(false)
     }
+}
 
-    pub fn route_for_public_model(&self, provider: &str, public_model: &str) -> Option<ModelRoute> {
-        self.routes
-            .get(provider)
-            .and_then(|routes| routes.get(public_model))
-            .cloned()
-    }
-
-    pub fn public_models_list(&self, provider: &str) -> Value {
-        let data = self
-            .model_order
-            .get(provider)
-            .into_iter()
-            .flatten()
-            .map(|public_model| {
-                serde_json::json!({
-                    "id": public_model,
-                    "object": "model",
-                    "created": 1_700_000_000i64,
-                    "owned_by": "local-llm-proxy",
-                })
-            })
-            .collect::<Vec<_>>();
-        serde_json::json!({
-            "object": "list",
-            "data": data,
-        })
-    }
+/// 将动态路由与静态 provider 目录解析为可转发的 ModelRoute。
+pub fn resolve_route(
+    catalog: &ProviderCatalog,
+    table: &RouteTable,
+    public_model: &str,
+) -> Option<ModelRoute> {
+    let config = table.get(public_model)?;
+    let provider = catalog.get(&config.provider)?;
+    let channel = provider.adapter_for(&config.upstream_model)?;
+    Some(ModelRoute {
+        origin_model: config.upstream_model.clone(),
+        public_model: public_model.to_string(),
+        provider_name: provider.name.clone(),
+        upstream_base_url: provider.base_url.clone(),
+        api_key: provider.api_key.clone(),
+        channel,
+        supports_compact: provider.supports_compact,
+    })
 }
 
 #[cfg(test)]
@@ -232,7 +318,7 @@ mod tests {
     const CONFIG: &str = r#"
 bind_addr = "127.0.0.1:8787"
 exchange_log_dir = ".run/exchanges"
-default_provider = "ada"
+default_provider = "mmkg"
 
 [[providers]]
 name = "ada"
@@ -241,19 +327,12 @@ api_key = "ada-secret"
 supports_compact = false
 
 [[providers.models]]
-public_model = "gpt-luna"
 upstream_model = "DeepSeek-V4-Flash"
 response_adapter = "deepseek"
 
 [[providers.models]]
-public_model = "gpt-terra"
 upstream_model = "DeepSeek-V4-Pro"
 response_adapter = "deepseek"
-
-[[providers.models]]
-public_model = "gpt-sol"
-upstream_model = "glm-5.2"
-response_adapter = "glm"
 
 [[providers]]
 name = "mmkg"
@@ -262,143 +341,175 @@ api_key = "mmkg-secret"
 supports_compact = true
 
 [[providers.models]]
-public_model = "gpt-luna"
-upstream_model = "gpt-luna"
+upstream_model = "gpt-5.6-luna"
 response_adapter = "standard"
 
 [[providers.models]]
-public_model = "gpt-sol"
-upstream_model = "gpt-sol"
+upstream_model = "gpt-5.6-terra"
 response_adapter = "standard"
 
 [[providers.models]]
-public_model = "gpt-5.6"
+upstream_model = "gpt-5.6-sol"
+response_adapter = "standard"
+
+[[providers.models]]
 upstream_model = "gpt-5.6"
 response_adapter = "standard"
 "#;
 
     #[test]
-    fn loads_multiple_providers_and_resolves_route_details() {
+    fn loads_providers_with_per_model_adapters() {
         let config = AppConfig::from_toml(CONFIG).unwrap();
-        let registry = ProviderRegistry::new(config).unwrap();
+        let catalog = ProviderCatalog::new(config).unwrap();
 
-        assert_eq!(registry.default_provider(), "ada");
         assert_eq!(
-            registry.provider_names(),
+            catalog.provider_names(),
             &["ada".to_string(), "mmkg".to_string()]
         );
+        let ada = catalog.get("ada").unwrap();
+        assert_eq!(
+            ada.adapter_for("DeepSeek-V4-Flash"),
+            Some(ChannelKind::DeepSeek)
+        );
+        assert!(ada.supports_model("DeepSeek-V4-Pro"));
+        assert!(!ada.supports_compact);
 
-        let route = registry.route_for_public_model("mmkg", "gpt-5.6").unwrap();
-        assert_eq!(route.provider_name, "mmkg");
-        assert_eq!(route.origin_model, "gpt-5.6");
-        assert_eq!(route.upstream_base_url, "https://mmkg.example/v1");
-        assert_eq!(route.api_key, "mmkg-secret");
-        assert!(route.supports_compact);
-        assert_eq!(route.channel, ChannelKind::Standard);
-
-        let deepseek_route = registry.route_for_public_model("ada", "gpt-luna").unwrap();
-        assert_eq!(deepseek_route.channel, ChannelKind::DeepSeek);
-        assert!(!deepseek_route.supports_compact);
-
-        let same_provider_glm = registry.route_for_public_model("ada", "gpt-sol").unwrap();
-        assert_eq!(same_provider_glm.provider_name, "ada");
-        assert_eq!(same_provider_glm.channel, ChannelKind::Glm);
-        assert!(!same_provider_glm.supports_compact);
+        let mmkg = catalog.get("mmkg").unwrap();
+        assert_eq!(
+            mmkg.adapter_for("gpt-5.6-luna"),
+            Some(ChannelKind::Standard)
+        );
+        assert_eq!(mmkg.adapter_for("gpt-5.6"), Some(ChannelKind::Standard));
+        assert!(mmkg.supports_compact);
     }
 
     #[test]
-    fn resolves_overlapping_model_by_active_provider() {
-        let registry = ProviderRegistry::new(AppConfig::from_toml(CONFIG).unwrap()).unwrap();
+    fn route_table_round_trips_through_json() {
+        let mut table = RouteTable::default();
+        table.set(
+            "gpt-5.6-luna".to_string(),
+            ModelRouteConfig {
+                provider: "ada".to_string(),
+                upstream_model: "DeepSeek-V4-Flash".to_string(),
+            },
+        );
 
-        let ada = registry.route_for_public_model("ada", "gpt-luna").unwrap();
-        assert_eq!(ada.origin_model, "DeepSeek-V4-Flash");
-        assert_eq!(ada.channel, ChannelKind::DeepSeek);
-
-        let mmkg = registry.route_for_public_model("mmkg", "gpt-luna").unwrap();
-        assert_eq!(mmkg.origin_model, "gpt-luna");
-        assert_eq!(mmkg.channel, ChannelKind::Standard);
-
-        assert!(registry.route_for_public_model("ada", "gpt-5.6").is_none());
+        let json = serde_json::to_string(&table).unwrap();
+        let decoded: RouteTable = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.get("gpt-5.6-luna").unwrap().upstream_model,
+            "DeepSeek-V4-Flash"
+        );
     }
 
     #[test]
-    fn public_models_list_is_scoped_to_provider() {
-        let registry = ProviderRegistry::new(AppConfig::from_toml(CONFIG).unwrap()).unwrap();
+    fn ensure_default_self_routes_fills_only_missing_supported_models() {
+        let catalog = ProviderCatalog::new(AppConfig::from_toml(CONFIG).unwrap()).unwrap();
+        let mut table = RouteTable::default();
+        table.set(
+            "gpt-5.6-luna".to_string(),
+            ModelRouteConfig {
+                provider: "ada".to_string(),
+                upstream_model: "DeepSeek-V4-Flash".to_string(),
+            },
+        );
 
-        let ada_list = registry.public_models_list("ada");
-        let ada_ids = ada_list["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|model| model["id"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(ada_ids, vec!["gpt-luna", "gpt-terra", "gpt-sol"]);
+        let added = table.ensure_default_self_routes(&catalog);
 
-        let mmkg_list = registry.public_models_list("mmkg");
-        let mmkg_ids = mmkg_list["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|model| model["id"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(mmkg_ids, vec!["gpt-luna", "gpt-sol", "gpt-5.6"]);
+        // luna 已有显式路由，不覆盖；terra/sol 是 default provider mmkg 的同名模型，补缺。
+        assert_eq!(added, 2);
+        assert_eq!(table.get("gpt-5.6-luna").unwrap().provider, "ada");
+        assert_eq!(
+            table.get("gpt-5.6-terra").unwrap().upstream_model,
+            "gpt-5.6-terra"
+        );
+        assert_eq!(table.get("gpt-5.6-terra").unwrap().provider, "mmkg");
+        assert_eq!(table.get("gpt-5.6-sol").unwrap().provider, "mmkg");
     }
 
     #[test]
-    fn rejects_unknown_default_provider() {
-        let config = AppConfig::from_toml(&CONFIG.replace(
-            "default_provider = \"ada\"",
-            "default_provider = \"missing\"",
-        ))
-        .unwrap();
-        let error = ProviderRegistry::new(config).unwrap_err();
-        assert!(error.to_string().contains("default_provider"));
+    fn resolves_route_by_combining_dynamic_table_and_static_catalog() {
+        let catalog = ProviderCatalog::new(AppConfig::from_toml(CONFIG).unwrap()).unwrap();
+        let mut table = RouteTable::default();
+        table.set(
+            "gpt-5.6-luna".to_string(),
+            ModelRouteConfig {
+                provider: "ada".to_string(),
+                upstream_model: "DeepSeek-V4-Flash".to_string(),
+            },
+        );
+
+        let route = resolve_route(&catalog, &table, "gpt-5.6-luna").unwrap();
+        assert_eq!(route.public_model, "gpt-5.6-luna");
+        assert_eq!(route.origin_model, "DeepSeek-V4-Flash");
+        assert_eq!(route.provider_name, "ada");
+        assert_eq!(route.upstream_base_url, "http://ada.example/v1");
+        assert_eq!(route.channel, ChannelKind::DeepSeek);
+        assert!(!route.supports_compact);
     }
 
     #[test]
-    fn rejects_duplicate_public_model_within_same_provider() {
-        let config = AppConfig::from_toml(&CONFIG.replace(
-            "public_model = \"gpt-terra\"",
-            "public_model = \"gpt-luna\"",
-        ))
-        .unwrap();
-        let error = ProviderRegistry::new(config).unwrap_err();
-        assert!(error.to_string().contains("duplicate public model"));
+    fn resolve_route_is_none_for_missing_route_or_provider_or_model() {
+        let catalog = ProviderCatalog::new(AppConfig::from_toml(CONFIG).unwrap()).unwrap();
+        let table = RouteTable::default();
+        assert!(resolve_route(&catalog, &table, "gpt-5.6-luna").is_none());
+
+        let mut table = RouteTable::default();
+        table.set(
+            "gpt-5.6-luna".to_string(),
+            ModelRouteConfig {
+                provider: "missing".to_string(),
+                upstream_model: "x".to_string(),
+            },
+        );
+        assert!(resolve_route(&catalog, &table, "gpt-5.6-luna").is_none());
+
+        let mut table = RouteTable::default();
+        table.set(
+            "gpt-5.6-luna".to_string(),
+            ModelRouteConfig {
+                provider: "ada".to_string(),
+                upstream_model: "not-declared".to_string(),
+            },
+        );
+        assert!(resolve_route(&catalog, &table, "gpt-5.6-luna").is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_provider_name() {
+        let input = CONFIG.replace("name = \"mmkg\"", "name = \"ada\"");
+        let error = ProviderCatalog::new(AppConfig::from_toml(&input).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("duplicate provider"));
+    }
+
+    #[test]
+    fn rejects_duplicate_upstream_model_within_provider() {
+        let input = CONFIG.replace(
+            "upstream_model = \"DeepSeek-V4-Pro\"",
+            "upstream_model = \"DeepSeek-V4-Flash\"",
+        );
+        let error = ProviderCatalog::new(AppConfig::from_toml(&input).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("duplicate upstream model"));
     }
 
     #[test]
     fn rejects_provider_without_models() {
-        let config = AppConfig::from_toml(
-            r#"
-            default_provider = "empty"
-            [[providers]]
-            name = "empty"
-            base_url = "https://example.com/v1"
-            api_key = "empty-secret"
-            supports_compact = false
-            "#,
-        )
-        .unwrap();
-
-        let error = ProviderRegistry::new(config).unwrap_err();
-        assert!(error.to_string().contains("must define at least one model"));
+        let input = r#"
+default_provider = "empty"
+[[providers]]
+name = "empty"
+base_url = "http://empty.example/v1"
+api_key = "empty-secret"
+supports_compact = false
+"#;
+        let error = ProviderCatalog::new(AppConfig::from_toml(input).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("at least one model"));
     }
 
     #[test]
     fn rejects_invalid_provider_url() {
-        let config =
-            AppConfig::from_toml(&CONFIG.replace("https://mmkg.example/v1", "not-a-url")).unwrap();
-        let error = ProviderRegistry::new(config).unwrap_err();
+        let input = CONFIG.replace("https://mmkg.example/v1", "not-a-url");
+        let error = ProviderCatalog::new(AppConfig::from_toml(&input).unwrap()).unwrap_err();
         assert!(error.to_string().contains("base_url"));
-    }
-
-    #[test]
-    fn rejects_unknown_response_adapter_during_parse() {
-        let error = AppConfig::from_toml(&CONFIG.replace(
-            "response_adapter = \"standard\"",
-            "response_adapter = \"unknown\"",
-        ))
-        .unwrap_err();
-        assert!(error.to_string().contains("response_adapter"));
     }
 }
