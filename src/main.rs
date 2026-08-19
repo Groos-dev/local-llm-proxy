@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use local_llm_proxy::{
     ExchangeLog, ModelRoute, ModelRouteConfig, PUBLIC_MODELS, ProviderCatalog, RouteTable,
     SseModelRestorer, normalize_request_for_upstream, normalize_response_for_client, resolve_route,
-    rewrite_request_model,
+    rewrite_request_model, should_inject_notool,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -293,7 +293,14 @@ async fn responses(State(state): State<AppState>, request: Request) -> Response 
         return raw_response(status, bytes, &content_type, None, &response_headers);
     }
     if content_type.starts_with("text/event-stream") {
-        return stream_response(upstream, route, &response_headers, Some(exchange));
+        let inject_notool = should_inject_notool(&codex_request);
+        return stream_response(
+            upstream,
+            route,
+            &response_headers,
+            Some(exchange),
+            inject_notool,
+        );
     }
 
     let bytes = upstream.bytes().await.unwrap_or_default();
@@ -412,6 +419,7 @@ fn stream_response(
     route: ModelRoute,
     headers: &HeaderMap,
     exchange: Option<ExchangeLog>,
+    inject_notool: bool,
 ) -> Response {
     let source = upstream.bytes_stream();
     let response_headers = headers.clone();
@@ -420,7 +428,11 @@ fn stream_response(
         exchange.note_sse_headers(&response_headers);
     }
     let output = stream! {
-        let mut restorer = SseModelRestorer::default();
+        let mut restorer = if inject_notool {
+            SseModelRestorer::with_inject_notool()
+        } else {
+            SseModelRestorer::default()
+        };
         let mut raw = Vec::new();
         futures_util::pin_mut!(source);
         while let Some(chunk) = source.next().await {

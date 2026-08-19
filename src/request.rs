@@ -1,6 +1,43 @@
 use crate::model::ModelRoute;
 use serde_json::Value;
 
+const NOTOOL_CALL_ID: &str = "call_proxy_notool";
+
+/// Returns true when the last assistant message in the input has no following tool call
+/// or tool output, and no prior injection (identified by NOTOOL_CALL_ID) exists.
+pub fn should_inject_notool(body: &Value) -> bool {
+    let Some(input) = body.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    if input.is_empty() {
+        return false;
+    }
+    // Already injected once: look for any item whose call_id matches.
+    let already_injected = input
+        .iter()
+        .any(|item| item.get("call_id").and_then(Value::as_str) == Some(NOTOOL_CALL_ID));
+    if already_injected {
+        return false;
+    }
+    // Find the last assistant message; check nothing follows it that is a tool call or output.
+    let last_assistant_idx = input.iter().rposition(|item| {
+        item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("assistant")
+    });
+    let Some(idx) = last_assistant_idx else {
+        return false;
+    };
+    let has_following_tool = input[idx + 1..].iter().any(|item| {
+        item.get("type").and_then(Value::as_str).is_some_and(|t| {
+            t == "custom_tool_call"
+                || t == "function_call"
+                || t == "custom_tool_call_output"
+                || t == "function_call_output"
+        })
+    });
+    !has_following_tool
+}
+
 /// Codex-facing request prep, then upstream-channel-specific adaptations.
 pub fn normalize_request_for_upstream(route: &ModelRoute, body: &mut Value) {
     route.channel.normalize_request(body);
@@ -74,6 +111,49 @@ mod tests {
         normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn should_inject_when_last_item_is_assistant_message_with_no_tool_call() {
+        let request = json!({
+            "input": [
+                {"role": "user", "content": "do something"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I will read the file."}]}
+            ]
+        });
+        assert!(should_inject_notool(&request));
+    }
+
+    #[test]
+    fn should_not_inject_when_assistant_message_followed_by_tool_output() {
+        let request = json!({
+            "input": [
+                {"role": "user", "content": "do something"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "reading."}]},
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "", "status": "completed"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": "result"}
+            ]
+        });
+        assert!(!should_inject_notool(&request));
+    }
+
+    #[test]
+    fn should_not_inject_when_already_injected() {
+        let request = json!({
+            "input": [
+                {"role": "user", "content": "do something"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "planning."}]},
+                {"type": "custom_tool_call", "call_id": "call_proxy_notool", "name": "exec", "input": "", "status": "completed"},
+                {"type": "custom_tool_call_output", "call_id": "call_proxy_notool", "output": "continue"}
+            ]
+        });
+        assert!(!should_inject_notool(&request));
+    }
+
+    #[test]
+    fn should_not_inject_when_no_input() {
+        let request = json!({"model": "gpt-5.6"});
+        assert!(!should_inject_notool(&request));
     }
 
     #[test]
