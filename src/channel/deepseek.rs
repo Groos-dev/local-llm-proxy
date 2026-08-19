@@ -16,7 +16,6 @@ impl UpstreamChannel for DeepSeekChannel {
         if body.get("store").is_some() {
             body["store"] = Value::Bool(false);
         }
-        strip_unsupported_include(body);
         // Keep custom_tool_call as-is (upstream accepts top-level custom tools).
         // Ada rejects parallel tool-call batches; serialize to call/output pairs.
         serialize_parallel_tool_calls(body);
@@ -45,19 +44,6 @@ fn has_tools(body: &Value) -> bool {
     body.get("tools")
         .and_then(|tools| tools.as_array())
         .is_some_and(|tools| !tools.is_empty())
-}
-
-fn strip_unsupported_include(body: &mut Value) {
-    let Some(include) = body
-        .get_mut("include")
-        .and_then(|include| include.as_array_mut())
-    else {
-        return;
-    };
-    include.retain(|item| {
-        item.as_str()
-            .is_none_or(|value| value != "reasoning.encrypted_content")
-    });
 }
 
 fn downgrade_json_schema_text_format(body: &mut Value) {
