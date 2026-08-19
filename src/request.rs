@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn forces_store_false_and_strips_encrypted_include() {
+    fn forces_store_false_and_keeps_encrypted_include() {
         let mut request = json!({
             "store": true,
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
@@ -367,7 +367,10 @@ mod tests {
         normalize_request_for_upstream(&deepseek(), &mut request);
 
         assert_eq!(request["store"], false);
-        assert_eq!(request["include"], json!(["file_search_call.results"]));
+        assert_eq!(
+            request["include"],
+            json!(["reasoning.encrypted_content", "file_search_call.results"])
+        );
         assert_eq!(request["reasoning"]["effort"], "high");
     }
 }
