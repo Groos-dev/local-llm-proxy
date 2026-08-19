@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_reasoning_content_in_sse_output_item_events() {
+    fn keeps_reasoning_content_in_sse_output_item_events() {
         let route = route();
         let stream = concat!(
             "event: response.output_item.done\r\n",
@@ -265,7 +265,7 @@ mod tests {
 
         assert!(text.contains("\"type\":\"reasoning\""));
         assert!(text.contains("public-model"));
-        assert!(!text.contains("reasoning_content"));
+        assert!(text.contains("reasoning_content"));
         assert!(!text.contains("ep-5e9quh5a"));
     }
 
