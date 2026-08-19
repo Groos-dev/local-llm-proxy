@@ -14,5 +14,6 @@ pub use config::{
 pub use exchange::ExchangeLog;
 pub use model::{ModelRoute, restore_public_model, rewrite_request_model};
 pub use request::normalize_request_for_upstream;
+pub use request::should_inject_notool;
 pub use response::normalize_response_for_client;
 pub use sse::SseModelRestorer;

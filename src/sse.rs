@@ -8,6 +8,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct SseModelRestorer {
     pending: Vec<u8>,
+    inject_notool: bool,
     /// DeepSeek/GLM: item ids from top-level `function_call` we rewrite into `exec`.
     nested_fn_ids: HashMap<String, NestedFnRewrite>,
     /// Buffered JSON argument fragments; flushed as wrapped JS on arguments.done.
@@ -15,6 +16,13 @@ pub struct SseModelRestorer {
 }
 
 impl SseModelRestorer {
+    pub fn with_inject_notool() -> Self {
+        SseModelRestorer {
+            inject_notool: true,
+            ..Default::default()
+        }
+    }
+
     pub fn push(&mut self, chunk: &[u8], route: &ModelRoute) -> Vec<Vec<u8>> {
         self.pending.extend_from_slice(chunk);
         let mut events = Vec::new();
@@ -66,6 +74,7 @@ fn normalize_sse_event(
     let mut rewritten = Vec::new();
     let mut data_type: Option<String> = None;
     let mut drop_event = false;
+    let mut inject_events: Vec<Vec<u8>> = Vec::new();
 
     for line in text.split_inclusive(newline) {
         let Some(data) = line.strip_prefix("data: ") else {
@@ -95,11 +104,26 @@ fn normalize_sse_event(
             .get("type")
             .and_then(|value| value.as_str())
             .map(str::to_string);
+
+        if restorer.inject_notool
+            && data_type.as_deref() == Some("response.completed")
+            && response_has_no_tool_calls(&body)
+        {
+            let next_index = response_output_len(&body);
+            inject_events = build_notool_injection_events(next_index, newline);
+            inject_tool_call_into_completed_response(&mut body, next_index);
+        }
         rewritten.push(format!("data: {}{newline}", body));
     }
 
     if drop_event {
         return None;
+    }
+
+    if !inject_events.is_empty() {
+        let mut combined = inject_events.concat();
+        combined.extend(rewritten.concat().into_bytes());
+        return Some(combined);
     }
 
     if let Some(data_type) = data_type.as_deref() {
@@ -117,6 +141,92 @@ fn normalize_sse_event(
     }
 
     Some(rewritten.concat().into_bytes())
+}
+
+const NOTOOL_CALL_ID: &str = "call_proxy_notool";
+const NOTOOL_ITEM_ID: &str = "ctc_call_proxy_notool";
+const NOTOOL_EXEC_INPUT: &str = r#"const r = await tools.exec_command({cmd: "echo 'Continue working. Do not end this turn without at least one tool call that makes concrete progress toward the task.'"}); text(r.output);"#;
+
+fn response_has_no_tool_calls(body: &Value) -> bool {
+    let Some(response) = body.get("response") else {
+        return false;
+    };
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return false;
+    };
+    !output.iter().any(|item| {
+        item.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "custom_tool_call" || t == "function_call")
+    })
+}
+
+fn response_output_len(body: &Value) -> usize {
+    body.get("response")
+        .and_then(|r| r.get("output"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn build_notool_injection_events(output_index: usize, newline: &str) -> Vec<Vec<u8>> {
+    let item_added = serde_json::json!({
+        "type": "response.output_item.added",
+        "output_index": output_index,
+        "item": {
+            "type": "custom_tool_call",
+            "id": NOTOOL_ITEM_ID,
+            "call_id": NOTOOL_CALL_ID,
+            "name": "exec",
+            "input": "",
+            "status": "in_progress"
+        }
+    });
+    let input_done = serde_json::json!({
+        "type": "response.custom_tool_call_input.done",
+        "output_index": output_index,
+        "item_id": NOTOOL_ITEM_ID,
+        "input": NOTOOL_EXEC_INPUT
+    });
+    let item_done = serde_json::json!({
+        "type": "response.output_item.done",
+        "output_index": output_index,
+        "item": {
+            "type": "custom_tool_call",
+            "id": NOTOOL_ITEM_ID,
+            "call_id": NOTOOL_CALL_ID,
+            "name": "exec",
+            "input": NOTOOL_EXEC_INPUT,
+            "status": "completed"
+        }
+    });
+    vec![
+        format!("event: response.output_item.added{newline}data: {item_added}{newline}{newline}").into_bytes(),
+        format!("event: response.custom_tool_call_input.done{newline}data: {input_done}{newline}{newline}").into_bytes(),
+        format!("event: response.output_item.done{newline}data: {item_done}{newline}{newline}").into_bytes(),
+    ]
+}
+
+fn inject_tool_call_into_completed_response(body: &mut Value, _output_index: usize) {
+    let Some(response) = body.get_mut("response") else {
+        return;
+    };
+    if let Some(end_turn) = response.get_mut("end_turn") {
+        *end_turn = Value::Bool(false);
+    } else {
+        response["end_turn"] = Value::Bool(false);
+    }
+    let tool_call = serde_json::json!({
+        "type": "custom_tool_call",
+        "id": NOTOOL_ITEM_ID,
+        "call_id": NOTOOL_CALL_ID,
+        "name": "exec",
+        "input": NOTOOL_EXEC_INPUT,
+        "status": "completed"
+    });
+    if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+        output.push(tool_call);
+    }
 }
 
 enum SseAction {
@@ -318,5 +428,54 @@ mod tests {
         assert!(text.contains("\"type\":\"custom_tool_call\""));
         assert!(text.contains("\"name\":\"exec\""));
         assert!(!text.contains("\"name\":\"apply_patch\""));
+    }
+
+    #[test]
+    fn injects_tool_call_when_response_has_no_tool_calls() {
+        let route = route();
+        let stream = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"ep-x\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will read the file.\"}]}]}}\n\n"
+        );
+        let mut restorer = SseModelRestorer::with_inject_notool();
+        let events = restorer.push(stream.as_bytes(), &route);
+        let text = String::from_utf8(events.concat()).unwrap();
+
+        assert!(text.contains("response.output_item.added"));
+        assert!(text.contains("response.custom_tool_call_input.done"));
+        assert!(text.contains("response.output_item.done"));
+        assert!(text.contains("\"call_id\":\"call_proxy_notool\""));
+        assert!(text.contains("\"name\":\"exec\""));
+        assert!(text.contains("\"end_turn\":false"));
+        assert!(text.matches("call_proxy_notool").count() >= 2);
+    }
+
+    #[test]
+    fn does_not_inject_when_response_already_has_tool_call() {
+        let route = route();
+        let stream = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"ep-x\",\"output\":[{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"name\":\"exec\",\"input\":\"echo hi\",\"status\":\"completed\"}]}}\n\n"
+        );
+        let mut restorer = SseModelRestorer::with_inject_notool();
+        let events = restorer.push(stream.as_bytes(), &route);
+        let text = String::from_utf8(events.concat()).unwrap();
+
+        assert!(!text.contains("call_proxy_notool"));
+    }
+
+    #[test]
+    fn does_not_inject_when_not_enabled() {
+        let route = route();
+        let stream = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"ep-x\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"planning.\"}]}]}}\n\n"
+        );
+        let mut restorer = SseModelRestorer::default();
+        let events = restorer.push(stream.as_bytes(), &route);
+        let text = String::from_utf8(events.concat()).unwrap();
+
+        assert!(!text.contains("call_proxy_notool"));
+        assert!(!text.contains("\"end_turn\":false"));
     }
 }
