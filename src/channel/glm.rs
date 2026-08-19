@@ -1,7 +1,7 @@
 use super::UpstreamChannel;
 use super::tool_compat::{
     normalize_exec_tool_calls, promote_additional_tools, rewrite_exec_tool_description,
-    serialize_parallel_tool_calls, strip_tool_call_reasoning_content,
+    serialize_parallel_tool_calls,
 };
 use serde_json::Value;
 
@@ -18,7 +18,6 @@ impl UpstreamChannel for GlmChannel {
 
     fn normalize_response(&self, body: &mut Value) {
         normalize_exec_tool_calls(body);
-        strip_tool_call_reasoning_content(body);
     }
 }
 
@@ -98,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_reasoning_content_from_tool_calls() {
+    fn keeps_reasoning_content_on_tool_calls() {
         let mut body = json!({
             "output": [
                 {
@@ -122,8 +121,8 @@ mod tests {
 
         GlmChannel.normalize_response(&mut body);
 
-        assert!(body["output"][0].get("reasoning_content").is_none());
-        assert!(body["output"][1].get("reasoning_content").is_none());
+        assert_eq!(body["output"][0]["reasoning_content"], "think");
+        assert_eq!(body["output"][1]["reasoning_content"], "run");
         assert_eq!(body["output"][2]["summary"][0]["text"], "keep");
     }
 }

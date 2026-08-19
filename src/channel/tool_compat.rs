@@ -155,39 +155,6 @@ fn call_id(item: &Value) -> Option<&str> {
     item.get("call_id").and_then(Value::as_str)
 }
 
-/// Ada may attach `reasoning_content` on tool calls; Codex does not expect it there.
-pub(crate) fn strip_tool_call_reasoning_content(body: &mut Value) {
-    if let Some(item) = body.get_mut("item") {
-        strip_reasoning_content_from_item(item);
-    }
-    strip_reasoning_content_from_output(body);
-    if let Some(response) = body.get_mut("response") {
-        strip_reasoning_content_from_output(response);
-    }
-}
-
-fn strip_reasoning_content_from_output(value: &mut Value) {
-    let Some(output) = value
-        .get_mut("output")
-        .and_then(|output| output.as_array_mut())
-    else {
-        return;
-    };
-    for item in output {
-        strip_reasoning_content_from_item(item);
-    }
-}
-
-fn strip_reasoning_content_from_item(item: &mut Value) {
-    let is_tool_call = matches!(
-        item.get("type").and_then(|value| value.as_str()),
-        Some("function_call" | "custom_tool_call")
-    );
-    if is_tool_call && let Some(object) = item.as_object_mut() {
-        object.remove("reasoning_content");
-    }
-}
-
 const EXEC_DESCRIPTION_PREFIX: &str = "\
 HARD RULES for `exec` (read first):
 - `exec` is a JavaScript orchestrator, NOT a shell. Never pass JSON like {\"cmd\":...} as the tool input.

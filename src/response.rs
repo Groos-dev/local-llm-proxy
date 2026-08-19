@@ -25,7 +25,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_reasoning_content_from_tool_calls_and_keeps_reasoning_item() {
+    fn keeps_reasoning_content_on_tool_calls() {
         let route = route(ChannelKind::DeepSeek);
         let mut body = json!({
             "model": "ep-07p4u7vn",
@@ -59,8 +59,8 @@ mod tests {
         assert_eq!(body["model"], "public-model");
         assert_eq!(body["output"][0]["type"], "reasoning");
         assert_eq!(body["output"][0]["summary"][0]["text"], "think");
-        assert!(body["output"][1].get("reasoning_content").is_none());
-        assert!(body["output"][2].get("reasoning_content").is_none());
+        assert_eq!(body["output"][1]["reasoning_content"], "think");
+        assert_eq!(body["output"][2]["reasoning_content"], "run it");
         assert_eq!(body["output"][1]["arguments"], "{\"city\":\"Shanghai\"}");
         assert_eq!(body["output"][2]["input"], "echo hi");
     }
@@ -85,7 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn glm_channel_strips_reasoning_content_from_tool_calls() {
+    fn glm_channel_keeps_reasoning_content_on_tool_calls() {
         let route = route(ChannelKind::Glm);
         let mut body = json!({
             "model": "glm-5.2-discount",
@@ -100,7 +100,7 @@ mod tests {
         normalize_response_for_client(&route, &mut body);
 
         assert_eq!(body["model"], "public-model");
-        assert!(body["output"][0].get("reasoning_content").is_none());
+        assert_eq!(body["output"][0]["reasoning_content"], "think");
         assert_eq!(body["output"][0]["arguments"], "{\"ms\":1}");
     }
 
@@ -139,7 +139,7 @@ mod tests {
                 .starts_with("await tools.exec_command(JSON.parse(")
         );
         assert!(body["output"][0].get("arguments").is_none());
-        assert!(body["output"][0].get("reasoning_content").is_none());
+        assert_eq!(body["output"][0]["reasoning_content"], "run");
         assert!(
             body["output"][1]["input"]
                 .as_str()
