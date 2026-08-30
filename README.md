@@ -1,90 +1,79 @@
 # local-llm-proxy
 
-面向个人本地 LLM 的 Responses API 兼容代理。它把固定的公开模型名映射到不同的 provider 部署，并适配上游请求/响应格式（含 SSE 流式响应）。
+面向 Codex 的本地 Responses API 代理。Codex 始终只连接本地入口，代理按当前 provider 将请求透传到 Responses，或转换为 Chat Completions / Anthropic Messages，并保留 SSE 与工具调用能力。
 
 ## 快速开始
 
 ```bash
-cp config.example.toml config.toml   # 填入真实 base_url / api_key
-./start.sh                           # 构建并以 127.0.0.1:8787 启动
-./llpx list                          # 查看 provider 与当前路由
-./stop.sh                            # 停止并清理 exchange 日志
+cp config.example.toml config.toml   # 填入 provider 连接信息
+cargo build --bins
+./llpx configure                     # cliclack 配置向导
+./llpx start                         # 启动代理并接管 Codex LLM 连接配置
+./llpx providers                     # 查看 JSON store 与运行时 provider
+./llpx use <provider>                # 运行中热切换 provider
+./llpx stop                          # 停止并还原 Codex 配置
 ```
 
 ## 配置
 
-`config.toml`（本地、gitignored）定义静态 provider 目录与默认 provider。以下是一个最小示例（完整模板见 `config.example.toml`）：
+`config.toml`（本地、gitignored）用于首次迁移。后续 provider 和模型映射持久化在 `~/.llpx/store.json`（可用 `LLPX_STORE` 覆盖）。以下是一个最小示例（完整模板见 `config.example.toml`）：
 
 ```toml
 bind_addr = "127.0.0.1:8787"
 exchange_log_dir = ".run/exchanges"
-default_provider = "mapped"
+active_provider = "mapped"
 
 [[providers]]
 name = "mapped"
 base_url = "https://provider-a.example/v1"
 api_key = "replace-me"
-supports_compact = false
-
-[[providers.models]]
-upstream_model = "upstream-flash"
-response_adapter = "deepseek"
+api_format = "openai_responses"
+upstream_model = "gpt-5.4"
 ```
 
-- `providers`：静态 provider 定义，只声明连接信息、支持的 upstream 模型及各自 `response_adapter`。
-- `response_adapter`：`standard` | `deepseek` | `glm`，决定请求/响应的上游适配方式。
-- `default_provider`：启动时用于补缺的默认 provider。
+- `active_provider`：启动时使用的 provider；运行中可通过 `llpx use` 或管理 API 热切换。
+- `api_format`：`openai_responses`（默认透传）、`openai_chat`（Chat Completions bridge）或 `anthropic`（Messages bridge）。
+- `upstream_model`：没有模型映射时使用的上游模型。
+- 启动时只改 Codex 当前 provider 的 `base_url`、`wire_api` 和 `auth.json` 中的 `OPENAI_API_KEY`；停止时按 backup 还原。
 
 ## 模型路由
 
-项目把静态 provider 目录与运行时的 public-model 路由表彻底解耦：
+`~/.llpx/store.json` 中的 `model_mappings` 保存 Codex/client model → upstream model 映射。新增 provider 时可设置默认模型；`llpx models sync <provider>` 会调用 provider 的模型列表接口，并为返回的模型建立原名映射。也可以直接设置映射：
 
-- 公开模型固定为 `gpt-5.6-luna`、`gpt-5.6-terra`、`gpt-5.6-sol`，由 `/v1/models` 和请求路由统一接受。
-- 动态路由表持久化在 `routes.json`，每个公开模型指向 `provider + upstream_model`：
-
-```json
-{
-  "routes": {
-    "gpt-5.6-luna": {
-      "provider": "mapped",
-      "upstream_model": "upstream-flash"
-    }
-  }
-}
+```bash
+./llpx mapping set <provider> <client-model> <upstream-model>
 ```
 
-- 启动时对缺少显式路由的公开模型做同名 self 路由补缺：仅当 `default_provider` 声明了同名 upstream model 时才写入，已有路由不受影响。
-- provider 只负责连接信息与 adapter，模型到 provider 的映射可运行时调整，无需重启。
+`GET /v1/models` 返回当前 provider 的 client model 映射键，Codex 的请求模型按映射后再转发。
 
 ## 管理 CLI
 
-`llpx` 支持交互式选择，`ESC` 可逐级回退：
+`llpx` 使用 `cliclack` 提供交互式向导，支持新增/编辑 provider、选择协议、同步模型、编辑映射、启动/停止和热切换：
 
 ```bash
-./start.sh                  # 构建后会在仓库根目录生成 ./llpx
-./llpx list
-./llpx set gpt-5.6-luna mapped upstream-flash
-./llpx unset gpt-5.6-luna
-./llpx                        # 交互式向导
-./llpx --base <url> list      # 指定代理地址
+./llpx configure
+./llpx provider upsert --name mmkg --base-url https://example/v1 --api-key "$KEY" --format responses --default-model gpt-5.4
+./llpx models sync mmkg
+./llpx mapping set mmkg gpt-5.6-luna upstream-model
+./llpx --base http://127.0.0.1:8787 use mmkg
 ```
 
 ## HTTP 接口
 
-- `GET /v1/models`：返回当前已配置路由的公开模型列表。
-- `POST /v1/responses`：Responses API 转发入口。
-- `POST /v1/responses/compact`、`POST /compact`：compact 透传入口；provider 不支持 compact 时返回 404。
-- `GET /v1/admin/providers`：查看 provider 目录。
-- `GET /v1/admin/routes`：查看当前动态路由。
-- `PUT /v1/admin/routes/{model}`：设置某个公开模型的 provider 与 upstream model。
-- `DELETE /v1/admin/routes/{model}`：删除某个公开模型的路由。
+- `POST /v1/responses`：Responses API 转发入口（Codex 统一入口）。
+- `POST /v1/responses/compact`、`POST /responses/compact`、`POST /compact`（及 `/v1/v1/...`、`/codex/v1/...` 别名）：与 cc-switch 一致——`openai_responses` 透传上游 `/responses/compact`；`openai_chat` / `anthropic` 走与 `/responses` 相同的协议桥（分别打到 `/chat/completions` 与 `/v1/messages`）。
+- `GET /health`：健康检查与当前 active provider。
+- `GET /v1/admin/providers`：查看 provider 目录与当前 active。
+- `POST /v1/admin/active`：热切换 active provider（`{"name":"..."}`）。
 
 ## 环境变量
 
 - `CONFIG_PATH`：配置文件路径（默认 `config.toml`）。
 - `BIND_ADDR`：监听地址，覆盖配置中的 `bind_addr`。
 - `EXCHANGE_LOG_DIR`：exchange 日志目录（默认 `.run/exchanges`）。
-- `ROUTES_PATH`：动态路由表路径（默认 `.run/routes.json`）。
+- `LLPX_STORE`：JSON store 路径（默认 `~/.llpx/store.json`）。
+- `LLPX_CODEX_BACKUP`：Codex live backup 路径（默认 `.run/codex-live-backup.json`）。
+- `LLPX_SKIP_CODEX_LIVE=1`：启动代理时跳过 Codex 配置接管。
 
 ## 开发
 
