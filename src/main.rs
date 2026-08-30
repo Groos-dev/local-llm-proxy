@@ -96,17 +96,6 @@ impl AppState {
 async fn main() {
     let _ = env_logger::try_init();
 
-    // One-shot Codex live takeover helpers used by start.sh / stop.sh.
-    if env::var_os("LLPX_RESTORE_CODEX_LIVE").is_some() {
-        let backup = env::var_os("LLPX_CODEX_BACKUP")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".run/codex-live-backup.json"));
-        local_llm_proxy::codex_live::restore_takeover(&backup)
-            .unwrap_or_else(|err| panic!("restore Codex live config failed: {err}"));
-        eprintln!("restored Codex live config from {}", backup.display());
-        return;
-    }
-
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let toml_path = env::var_os("CONFIG_PATH")
         .map(PathBuf::from)
@@ -132,24 +121,9 @@ async fn main() {
     let (active_name, providers) = store
         .into_providers()
         .unwrap_or_else(|err| panic!("invalid provider configuration: {err}"));
-    let proxy_base = format!("http://{bind_addr}/v1");
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .unwrap_or_else(|err| panic!("failed to bind {bind_addr}: {err}"));
-
-    if env::var_os("LLPX_APPLY_CODEX_LIVE").is_some() {
-        let backup = env::var_os("LLPX_CODEX_BACKUP")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".run/codex-live-backup.json"));
-        let base = env::var("LLPX_PROXY_BASE").unwrap_or_else(|_| proxy_base.clone());
-        local_llm_proxy::codex_live::apply_takeover(&base, &backup)
-            .unwrap_or_else(|err| panic!("apply Codex live config failed: {err}"));
-        eprintln!(
-            "applied Codex live takeover base_url={base} wire_api=responses backup={}",
-            backup.display()
-        );
-        // Continue into server listen after apply.
-    }
 
     let runtime = RuntimeProviders {
         store_path: store_path.clone(),
@@ -804,6 +778,7 @@ mod tests {
             version: 1,
             bind_addr: None,
             exchange_log_dir: None,
+            codex_active: true,
             active_provider: "a".into(),
             providers: vec![provider("a", "model-a")],
         };
@@ -819,6 +794,7 @@ mod tests {
             version: 1,
             bind_addr: None,
             exchange_log_dir: None,
+            codex_active: true,
             active_provider: "a".into(),
             providers: vec![provider("a", "model-a"), provider("b", "model-b")],
         };

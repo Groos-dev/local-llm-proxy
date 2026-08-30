@@ -29,7 +29,7 @@ Hot-switch without restarting Codex:
 
 or `POST /v1/admin/active` with `{"name":"..."}` (also persists the active provider in the JSON store).
 
-Runtime files belong under `.run/` (gitignored). `./start.sh` applies Codex live takeover (`base_url` + `wire_api=responses` + auth placeholder); `./stop.sh` restores it. Set `LLPX_SKIP_CODEX_LIVE=1` to skip takeover.
+Runtime files belong under `.run/` (gitignored). `./llpx` opens the hierarchical TUI; its Codex `ACTIVE` state controls whether `./llpx start` applies live takeover (`base_url` + `wire_api=responses` + auth placeholder). `INACTIVE` leaves the Codex files untouched even while the proxy runs. `./llpx stop` restores an existing takeover. Set `LLPX_SKIP_CODEX_LIVE=1` to skip takeover.
 
 ## Build, Test, and Development Commands
 
@@ -38,8 +38,8 @@ cargo build                 # Build the debug proxy binary
 cargo test                  # Run unit tests
 cargo fmt --check           # Verify Rust formatting
 cargo clippy --all-targets  # Run Rust lints
-./start.sh                  # Build, apply Codex live config, listen on 127.0.0.1:8787
-./stop.sh                   # Restore Codex config and stop the proxy
+./llpx start                # Build, apply Codex live config, listen on 127.0.0.1:8787
+./llpx stop                 # Restore Codex config and stop the proxy
 ./llpx status               # Show proxy health / active provider
 ./llpx providers            # List configured providers
 ./llpx use <name>           # Hot-switch active upstream provider

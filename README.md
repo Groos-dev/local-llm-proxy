@@ -7,8 +7,8 @@
 ```bash
 cp config.example.toml config.toml   # 填入 provider 连接信息
 cargo build --bins
-./llpx configure                     # cliclack 配置向导
-./llpx start                         # 启动代理并接管 Codex LLM 连接配置
+./llpx configure                     # 层级式交互 TUI
+./llpx start                         # 启动代理；Codex 为 ACTIVE 时接管连接配置
 ./llpx providers                     # 查看 JSON store 与运行时 provider
 ./llpx use <provider>                # 运行中热切换 provider
 ./llpx stop                          # 停止并还原 Codex 配置
@@ -34,7 +34,7 @@ upstream_model = "gpt-5.4"
 - `active_provider`：启动时使用的 provider；运行中可通过 `llpx use` 或管理 API 热切换。
 - `api_format`：`openai_responses`（默认透传）、`openai_chat`（Chat Completions bridge）或 `anthropic`（Messages bridge）。
 - `upstream_model`：没有模型映射时使用的上游模型。
-- 启动时只改 Codex 当前 provider 的 `base_url`、`wire_api` 和 `auth.json` 中的 `OPENAI_API_KEY`；停止时按 backup 还原。
+- TUI 中 Codex 配置为 `ACTIVE` 时，启动会改写 Codex 的 `base_url`、`wire_api` 和 `auth.json` 中的 `OPENAI_API_KEY`；`INACTIVE` 时代理仍可启动，但不会改写这些文件。
 
 ## 模型路由
 
@@ -48,7 +48,7 @@ upstream_model = "gpt-5.4"
 
 ## 管理 CLI
 
-`llpx` 使用 `cliclack` 提供交互式向导，支持新增/编辑 provider、选择协议、同步模型、编辑映射、启动/停止和热切换：
+`llpx` 使用 `cliclack` 提供实时刷新的层级式 TUI：入口先选择 Codex 或 Claude Code；进入 Codex 后可管理配置激活状态、Providers、模型 Mapping，以及启动/停止代理。Provider 列表和 Mapping 会在返回菜单时立即刷新，操作本身不会留下日志行：
 
 ```bash
 ./llpx configure
