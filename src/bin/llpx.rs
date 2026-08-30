@@ -1,52 +1,102 @@
-use dialoguer::Select;
-use serde_json::{Value, json};
-use std::{env, process};
+//! llpx — Clack-style wizard + headless CLI for local-llm-proxy.
+
+use cliclack::{confirm, input, intro, outro, select, spinner};
+use local_llm_proxy::{
+    ApiFormat, LlpxStore, StoredProvider, default_store_path, load_runtime,
+    models_fetch::fetch_model_ids,
+};
+use std::{collections::BTreeMap, env, path::PathBuf, process, process::Command};
 
 const USAGE: &str = "\n\
 Usage:\n\
-  llpx                         # interactive wizard\n\
-  llpx wizard                  # interactive wizard\n\
-  llpx list\n\
-  llpx set                     # interactive: choose model/provider/upstream model\n\
-  llpx set <public_model>      # interactive: choose provider/upstream model\n\
-  llpx set <model> <provider> <upstream_model>\n\
-  llpx unset                   # interactive: choose a routed model to remove\n\
-  llpx unset <public_model>\n\
-  llpx --base <url> <command>\n\
+  llpx                      Interactive configure wizard (cliclack)\n\
+  llpx configure            Same as interactive wizard\n\
+  llpx status               Proxy health\n\
+  llpx providers            List providers (store + live)\n\
+  llpx use <name>           Hot-switch active provider\n\
+  llpx start                Start proxy + Codex live takeover\n\
+  llpx stop                 Stop proxy + restore Codex\n\
+  llpx provider upsert ...  Non-interactive provider write\n\
+  llpx models sync <name>   Fetch /v1/models + identity mappings\n\
+  llpx mapping set ...      Set a client model -> upstream model mapping\n\
+  llpx --base <url> ...     Override proxy base for live admin calls\n\
 \n\
-Dynamic model routing for local-llm-proxy.\n\
+provider upsert flags:\n\
+  --name <id> --base-url <url> --api-key <key>\n\
+  --format responses|chat|anthropic [--default-model <id>]\n\
 \n\
-Base URL resolution (first match wins):\n\
-  1. --base <url>\n\
-  2. LLPX_BASE\n\
-  3. PROXY_BASE\n\
-  4. http://127.0.0.1:8787\n";
-
-const PUBLIC_MODELS: [&str; 3] = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
+mapping set arguments:\n\
+  <provider> <client-model> <upstream-model>\n\
+\n\
+Env:\n\
+  LLPX_STORE   JSON store path (default ~/.llpx/store.json)\n\
+  CONFIG_PATH  TOML to migrate from when store is missing\n\
+  LLPX_BASE / PROXY_BASE  live proxy base (default http://127.0.0.1:8787)\n";
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let (base, args) = parse_base(args);
     let base = base.trim_end_matches('/').to_string();
+    let root = repo_root();
 
-    let result = if args.is_empty() {
-        wizard(&base).await
-    } else {
-        let command = args[0].as_str();
-        match command {
-            "list" => list(&base).await,
-            "wizard" => wizard(&base).await,
-            "set" => set_command(&base, &args[1..]).await,
-            "unset" => unset_command(&base, &args[1..]).await,
-            "-h" | "--help" | "help" => {
-                print!("{USAGE}");
-                return;
-            }
-            _ => {
-                eprint!("unknown command: {command}\n{USAGE}");
+    let result = match args.first().map(String::as_str) {
+        None | Some("configure") => run_wizard(&base, &root).await,
+        Some("status") => status(&base).await,
+        Some("providers") => providers_cmd(&base).await,
+        Some("use") => {
+            let name = args.get(1).cloned().unwrap_or_default();
+            if name.is_empty() {
+                eprint!("missing provider name\n{USAGE}");
                 process::exit(1);
             }
+            use_provider(&base, &name).await
+        }
+        Some("start") => start_proxy(&root),
+        Some("stop") => stop_proxy(&root),
+        Some("provider") => match args.get(1).map(String::as_str) {
+            Some("upsert") => provider_upsert(&args[2..]),
+            _ => {
+                eprint!(
+                    "usage: llpx provider upsert --name .. --base-url .. --api-key .. --format ..\n"
+                );
+                process::exit(1);
+            }
+        },
+        Some("models") => match args.get(1).map(String::as_str) {
+            Some("sync") => {
+                let name = args.get(2).cloned().unwrap_or_default();
+                if name.is_empty() {
+                    eprint!("usage: llpx models sync <provider-name>\n");
+                    process::exit(1);
+                }
+                match models_sync(&name).await {
+                    Ok(()) => refresh_live_provider_if_active(&base, &name).await,
+                    Err(err) => Err(err),
+                }
+            }
+            _ => {
+                eprint!("usage: llpx models sync <provider-name>\n");
+                process::exit(1);
+            }
+        },
+        Some("mapping") => match args.get(1).map(String::as_str) {
+            Some("set") if args.len() == 5 => match mapping_set(&args[2], &args[3], &args[4]) {
+                Ok(()) => refresh_live_provider_if_active(&base, &args[2]).await,
+                Err(err) => Err(err),
+            },
+            _ => {
+                eprint!("usage: llpx mapping set <provider> <client-model> <upstream-model>\n");
+                process::exit(1);
+            }
+        },
+        Some("-h" | "--help" | "help") => {
+            print!("{USAGE}");
+            return;
+        }
+        Some(other) => {
+            eprint!("unknown command: {other}\n{USAGE}");
+            process::exit(1);
         }
     };
 
@@ -54,6 +104,25 @@ async fn main() {
         eprintln!("error: {err}");
         process::exit(1);
     }
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn store_and_toml(root: &PathBuf) -> (PathBuf, PathBuf) {
+    let store = env::var_os("LLPX_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_store_path);
+    let toml = env::var_os("CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("config.toml"));
+    (store, toml)
+}
+
+fn load_or_migrate(root: &PathBuf) -> Result<(LlpxStore, PathBuf), String> {
+    let (store_path, toml) = store_and_toml(root);
+    load_runtime(&store_path, Some(&toml)).map_err(|e| e.to_string())
 }
 
 fn parse_base(mut args: Vec<String>) -> (String, Vec<String>) {
@@ -72,391 +141,513 @@ fn parse_base(mut args: Vec<String>) -> (String, Vec<String>) {
     (base, args)
 }
 
-async fn list(base: &str) -> Result<(), String> {
-    let providers = get_json(base, "/v1/admin/providers").await?;
-    let routes = get_json(base, "/v1/admin/routes").await?;
+async fn status(base: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let health = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("health: {}", health.status());
+    println!("{}", health.text().await.map_err(|e| e.to_string())?);
+    Ok(())
+}
 
-    println!("providers:");
-    for provider in providers["providers"].as_array().unwrap_or(&vec![]) {
-        let name = provider["name"].as_str().unwrap_or("");
-        let compact = provider["supports_compact"].as_bool().unwrap_or(false);
-        println!("  {name}  compact={compact}");
-        for model in provider["models"].as_array().unwrap_or(&vec![]) {
-            let upstream = model["upstream_model"].as_str().unwrap_or("");
-            let adapter = model["response_adapter"].as_str().unwrap_or("");
-            println!("    - {upstream}  adapter={adapter}");
+async fn providers_cmd(base: &str) -> Result<(), String> {
+    let root = repo_root();
+    let (store, path) = load_or_migrate(&root)?;
+    println!("store: {}", path.display());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "active": store.active_provider,
+            "providers": store.providers.iter().map(|p| serde_json::json!({
+                "name": p.name,
+                "api_format": p.api_format.as_str(),
+                "base_url": p.base_url,
+                "default_upstream_model": p.default_upstream_model,
+                "mappings": p.model_mappings.len(),
+            })).collect::<Vec<_>>(),
+        }))
+        .map_err(|e| e.to_string())?
+    );
+    // Best-effort live view
+    let client = reqwest::Client::new();
+    if let Ok(resp) = client
+        .get(format!("{base}/v1/admin/providers"))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            println!("live: {}", resp.text().await.unwrap_or_default());
         }
-    }
-
-    println!("routes:");
-    let routes_obj = routes["routes"].as_object();
-    if routes_obj.map(|m| m.is_empty()).unwrap_or(true) {
-        println!("  (empty)");
-        return Ok(());
-    }
-    for (model, route) in routes_obj.unwrap() {
-        let provider = route["provider"].as_str().unwrap_or("");
-        let upstream = route["upstream_model"].as_str().unwrap_or("");
-        println!("  {model} -> {provider}/{upstream}");
     }
     Ok(())
 }
 
-async fn set_command(base: &str, args: &[String]) -> Result<(), String> {
-    match args.len() {
-        0 => wizard(base).await,
-        1 => {
-            let model = &args[0];
-            ensure_public_model(model)?;
-            let providers = get_json(base, "/v1/admin/providers").await?;
-            let routes = get_json(base, "/v1/admin/routes").await?;
-            let Some((model, provider, upstream)) = choose_route(
-                &providers,
-                &routes,
-                InteractiveStep::Provider {
-                    public_model: model.clone(),
-                    can_return_to_model: false,
-                },
-            )?
-            else {
-                return Ok(());
-            };
-            set_route(base, &model, &provider, &upstream).await
+async fn use_provider(base: &str, name: &str) -> Result<(), String> {
+    let root = repo_root();
+    let (mut store, path) = load_or_migrate(&root)?;
+    store.set_active(name).map_err(|e| e.to_string())?;
+    store.save(&path).map_err(|e| e.to_string())?;
+    println!("store active → {name} ({})", path.display());
+
+    let client = reqwest::Client::new();
+    match client
+        .post(format!("{base}/v1/admin/active"))
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            println!("live: {status}");
+            println!("{body}");
+            if !status.is_success() {
+                return Err(format!("live provider switch failed: {status}"));
+            }
         }
-        3 => {
-            let model = &args[0];
-            ensure_public_model(model)?;
-            set_route(base, model, &args[1], &args[2]).await
-        }
-        _ => {
-            eprint!("invalid arguments for set\n{USAGE}");
-            process::exit(1);
+        Err(err) => {
+            println!("note: store updated; proxy not reachable ({err})");
         }
     }
+    Ok(())
 }
 
-async fn unset_command(base: &str, args: &[String]) -> Result<(), String> {
-    match args.len() {
-        0 => {
-            let routes = get_json(base, "/v1/admin/routes").await?;
-            let Some(model) = select_routed_model(&routes)? else {
-                return Ok(());
-            };
-            unset_route(base, &model).await
-        }
-        1 => {
-            ensure_public_model(&args[0])?;
-            unset_route(base, &args[0]).await
-        }
-        _ => {
-            eprint!("invalid arguments for unset\n{USAGE}");
-            process::exit(1);
+fn start_proxy(root: &PathBuf) -> Result<(), String> {
+    // Ensure store exists (migrate toml if needed) before start.sh loads config.
+    let (_, store_path) = load_or_migrate(root)?;
+    println!("using store {}", store_path.display());
+    // Point proxy at JSON store.
+    let status = Command::new(root.join("start.sh"))
+        .current_dir(root)
+        .env("LLPX_STORE", &store_path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("start.sh exited {status}"));
+    }
+    Ok(())
+}
+
+fn stop_proxy(root: &PathBuf) -> Result<(), String> {
+    let status = Command::new(root.join("stop.sh"))
+        .current_dir(root)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("stop.sh exited {status}"));
+    }
+    Ok(())
+}
+
+fn provider_upsert(args: &[String]) -> Result<(), String> {
+    let mut name = None;
+    let mut base_url = None;
+    let mut api_key = None;
+    let mut format = None;
+    let mut default_model = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                name = Some(args.get(i + 1).cloned().ok_or("missing --name value")?);
+                i += 2;
+            }
+            "--base-url" => {
+                base_url = Some(args.get(i + 1).cloned().ok_or("missing --base-url value")?);
+                i += 2;
+            }
+            "--api-key" => {
+                api_key = Some(args.get(i + 1).cloned().ok_or("missing --api-key value")?);
+                i += 2;
+            }
+            "--format" => {
+                format = Some(args.get(i + 1).cloned().ok_or("missing --format value")?);
+                i += 2;
+            }
+            "--default-model" => {
+                default_model = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .ok_or("missing --default-model value")?,
+                );
+                i += 2;
+            }
+            other => return Err(format!("unknown flag: {other}")),
         }
     }
-}
+    let name = name.ok_or("missing --name")?;
+    let base_url = base_url.ok_or("missing --base-url")?;
+    let api_key = api_key.ok_or("missing --api-key")?;
+    let format_raw = format.unwrap_or_else(|| "responses".into());
+    let api_format =
+        ApiFormat::parse(&format_raw).ok_or_else(|| format!("invalid --format {format_raw}"))?;
 
-async fn wizard(base: &str) -> Result<(), String> {
-    let providers = get_json(base, "/v1/admin/providers").await?;
-    let routes = get_json(base, "/v1/admin/routes").await?;
-    let Some((model, provider, upstream)) =
-        choose_route(&providers, &routes, InteractiveStep::PublicModel)?
-    else {
-        return Ok(());
+    let root = repo_root();
+    let (mut store, path) = match load_or_migrate(&root) {
+        Ok(v) => v,
+        Err(_) => {
+            let path = env::var_os("LLPX_STORE")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_store_path);
+            (LlpxStore::empty(&name), path)
+        }
     };
-    set_route(base, &model, &provider, &upstream).await
-}
 
-async fn set_route(base: &str, model: &str, provider: &str, upstream: &str) -> Result<(), String> {
-    let body = json!({ "provider": provider, "upstream_model": upstream });
-    let resp = put_json(base, &format!("/v1/admin/routes/{model}"), body).await?;
-    print_routes(&resp);
+    let mut mappings = BTreeMap::new();
+    if let Some(m) = default_model.as_ref() {
+        mappings.insert(m.clone(), m.clone());
+    }
+    store.upsert_provider(StoredProvider {
+        name: name.clone(),
+        base_url,
+        api_key,
+        api_format,
+        default_upstream_model: default_model,
+        model_mappings: mappings,
+        max_output_tokens: None,
+    });
+    store.set_active(&name).map_err(|e| e.to_string())?;
+    store.save(&path).map_err(|e| e.to_string())?;
+    println!("upserted provider '{name}' → {}", path.display());
     Ok(())
 }
 
-async fn unset_route(base: &str, model: &str) -> Result<(), String> {
-    let resp = delete_json(base, &format!("/v1/admin/routes/{model}")).await?;
-    print_routes(&resp);
+async fn models_sync(name: &str) -> Result<(), String> {
+    let root = repo_root();
+    let (mut store, path) = load_or_migrate(&root)?;
+    let provider = store
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("provider '{name}' not found"))?;
+    let spin = spinner();
+    spin.start(format!("fetching models from {} …", provider.base_url));
+    let ids = fetch_model_ids(&provider)
+        .await
+        .map_err(|e| e.to_string())?;
+    spin.stop(format!("found {} models", ids.len()));
+    let p = store
+        .get_mut(name)
+        .ok_or_else(|| format!("provider '{name}' missing"))?;
+    p.apply_identity_mappings_from_models(&ids);
+    store.save(&path).map_err(|e| e.to_string())?;
+    println!(
+        "synced identity mappings for '{name}' ({} entries) → {}",
+        store.get(name).map(|p| p.model_mappings.len()).unwrap_or(0),
+        path.display()
+    );
     Ok(())
 }
 
-fn ensure_public_model(model: &str) -> Result<(), String> {
-    if PUBLIC_MODELS.contains(&model) {
-        Ok(())
-    } else {
-        Err(format!("unsupported public model '{model}'"))
+async fn refresh_live_provider_if_active(base: &str, name: &str) -> Result<(), String> {
+    let root = repo_root();
+    let (store, _) = load_or_migrate(&root)?;
+    if store.active_provider == name {
+        use_provider(base, name).await?;
     }
+    Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum InteractiveStep {
-    PublicModel,
-    Provider {
-        public_model: String,
-        can_return_to_model: bool,
-    },
-    UpstreamModel {
-        public_model: String,
-        provider: String,
-        provider_can_return_to_model: bool,
-    },
-}
-
-fn previous_step(step: InteractiveStep) -> Option<InteractiveStep> {
-    match step {
-        InteractiveStep::PublicModel => None,
-        InteractiveStep::Provider {
-            can_return_to_model: true,
-            ..
-        } => Some(InteractiveStep::PublicModel),
-        InteractiveStep::Provider {
-            can_return_to_model: false,
-            ..
-        } => None,
-        InteractiveStep::UpstreamModel {
-            public_model,
-            provider: _,
-            provider_can_return_to_model,
-        } => Some(InteractiveStep::Provider {
-            public_model,
-            can_return_to_model: provider_can_return_to_model,
-        }),
+fn mapping_set(
+    provider_name: &str,
+    client_model: &str,
+    upstream_model: &str,
+) -> Result<(), String> {
+    if client_model.trim().is_empty() || upstream_model.trim().is_empty() {
+        return Err("model names must not be empty".into());
     }
+    let root = repo_root();
+    let (mut store, path) = load_or_migrate(&root)?;
+    let provider = store
+        .get_mut(provider_name)
+        .ok_or_else(|| format!("provider '{provider_name}' not found"))?;
+    provider
+        .model_mappings
+        .insert(client_model.trim().into(), upstream_model.trim().into());
+    store.save(&path).map_err(|e| e.to_string())?;
+    println!(
+        "mapped {client_model} -> {upstream_model} for '{provider_name}' ({})",
+        path.display()
+    );
+    Ok(())
 }
 
-fn choose_route(
-    providers: &Value,
-    routes: &Value,
-    mut step: InteractiveStep,
-) -> Result<Option<(String, String, String)>, String> {
+async fn run_wizard(base: &str, root: &PathBuf) -> Result<(), String> {
+    intro("local-llm-proxy").map_err(|e| e.to_string())?;
+    let (mut store, store_path) = match load_or_migrate(root) {
+        Ok(v) => v,
+        Err(_) => {
+            let path = env::var_os("LLPX_STORE")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_store_path);
+            (LlpxStore::empty("default"), path)
+        }
+    };
+
     loop {
-        step = match step {
-            InteractiveStep::PublicModel => match select_public_model()? {
-                Some(public_model) => InteractiveStep::Provider {
-                    public_model,
-                    can_return_to_model: true,
-                },
-                None => return Ok(None),
-            },
-            InteractiveStep::Provider {
-                public_model,
-                can_return_to_model,
-            } => match select_provider(providers)? {
-                Some(provider) => InteractiveStep::UpstreamModel {
-                    public_model,
-                    provider,
-                    provider_can_return_to_model: can_return_to_model,
-                },
-                None => {
-                    let current = InteractiveStep::Provider {
-                        public_model,
-                        can_return_to_model,
-                    };
-                    let Some(previous) = previous_step(current) else {
-                        return Ok(None);
-                    };
-                    previous
+        let action = select("What do you want to do?")
+            .item("start", "Start proxy (Codex live takeover)", "")
+            .item("stop", "Stop proxy (restore Codex)", "")
+            .item("switch", "Hot-switch active provider", "")
+            .item("add", "Add provider", "")
+            .item("edit", "Edit provider", "")
+            .item("sync", "Sync models (/v1/models → identity map)", "")
+            .item("mapping", "Edit model mapping", "")
+            .item("status", "Show status", "")
+            .item("quit", "Quit", "")
+            .interact()
+            .map_err(|e| e.to_string())?;
+
+        match action {
+            "start" => {
+                store.save(&store_path).map_err(|e| e.to_string())?;
+                start_proxy(root)?;
+            }
+            "stop" => stop_proxy(root)?,
+            "switch" => {
+                if store.providers.is_empty() {
+                    cliclack::log::warning("No providers yet — add one first.")
+                        .map_err(|e| e.to_string())?;
+                    continue;
                 }
-            },
-            InteractiveStep::UpstreamModel {
-                public_model,
-                provider,
-                provider_can_return_to_model,
-            } => {
-                let default = current_upstream(routes, &public_model);
-                match select_upstream_model(providers, &provider, Some(&default))? {
-                    Some(upstream_model) => {
-                        return Ok(Some((public_model, provider, upstream_model)));
+                let mut sel = select("Active provider");
+                for p in &store.providers {
+                    let hint = format!("{} · {}", p.api_format.as_str(), p.base_url);
+                    sel = sel.item(p.name.as_str(), p.name.as_str(), hint);
+                }
+                let name = sel.interact().map_err(|e| e.to_string())?.to_string();
+                store.set_active(&name).map_err(|e| e.to_string())?;
+                store.save(&store_path).map_err(|e| e.to_string())?;
+                use_provider(base, &name).await?;
+            }
+            "add" => {
+                let provider = prompt_provider(None)?;
+                let name = provider.name.clone();
+                store.upsert_provider(provider);
+                if confirm(format!("Set '{name}' as active provider?"))
+                    .initial_value(true)
+                    .interact()
+                    .map_err(|e| e.to_string())?
+                {
+                    store.set_active(&name).map_err(|e| e.to_string())?;
+                }
+                store.save(&store_path).map_err(|e| e.to_string())?;
+                if store.active_provider == name {
+                    use_provider(base, &name).await?;
+                }
+                cliclack::log::success(format!("Saved {name} → {}", store_path.display()))
+                    .map_err(|e| e.to_string())?;
+
+                if confirm("Fetch /v1/models and seed identity mappings now?")
+                    .initial_value(true)
+                    .interact()
+                    .map_err(|e| e.to_string())?
+                {
+                    let _ = models_sync(&name).await.map_err(|e| {
+                        let _ = cliclack::log::warning(format!("models sync failed: {e}"));
+                        e
+                    });
+                    // reload after sync
+                    if let Ok((s, _)) = load_or_migrate(root) {
+                        store = s;
                     }
-                    None => previous_step(InteractiveStep::UpstreamModel {
-                        public_model,
-                        provider,
-                        provider_can_return_to_model,
-                    })
-                    .expect("upstream model always has a provider parent"),
                 }
             }
-        };
+            "edit" => {
+                if store.providers.is_empty() {
+                    cliclack::log::warning("No providers yet — add one first.")
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
+                let mut sel = select("Provider to edit");
+                for p in &store.providers {
+                    let hint = format!("{} · {}", p.api_format.as_str(), p.base_url);
+                    sel = sel.item(p.name.as_str(), p.name.as_str(), hint);
+                }
+                let selected = sel.interact().map_err(|e| e.to_string())?.to_string();
+                let existing = store.get(&selected).cloned().unwrap();
+                let provider = prompt_provider(Some(&existing))?;
+                let name = provider.name.clone();
+                store
+                    .rename_provider(&selected, provider)
+                    .map_err(|e| e.to_string())?;
+                store.save(&store_path).map_err(|e| e.to_string())?;
+                if store.active_provider == name {
+                    use_provider(base, &name).await?;
+                }
+                cliclack::log::success(format!("Saved {name} → {}", store_path.display()))
+                    .map_err(|e| e.to_string())?;
+            }
+            "sync" => {
+                if store.providers.is_empty() {
+                    cliclack::log::warning("No providers yet.").map_err(|e| e.to_string())?;
+                    continue;
+                }
+                let mut sel = select("Provider to sync");
+                for p in &store.providers {
+                    sel = sel.item(p.name.as_str(), p.name.as_str(), p.base_url.as_str());
+                }
+                let name = sel.interact().map_err(|e| e.to_string())?.to_string();
+                models_sync(&name).await?;
+                if let Ok((s, _)) = load_or_migrate(root) {
+                    store = s;
+                }
+                refresh_live_provider_if_active(base, &name).await?;
+            }
+            "mapping" => {
+                if store.providers.is_empty() {
+                    cliclack::log::warning("No providers yet.").map_err(|e| e.to_string())?;
+                    continue;
+                }
+                let mut sel = select("Provider mapping");
+                for p in &store.providers {
+                    sel = sel.item(p.name.as_str(), p.name.as_str(), p.base_url.as_str());
+                }
+                let provider_name = sel.interact().map_err(|e| e.to_string())?.to_string();
+                let provider = store.get(&provider_name).unwrap();
+                let client_model: String = input("Codex/client model")
+                    .validate(|v: &String| {
+                        if v.trim().is_empty() {
+                            Err("required")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .interact()
+                    .map_err(|e| e.to_string())?;
+                let default_upstream = provider
+                    .model_mappings
+                    .get(client_model.trim())
+                    .map(String::as_str)
+                    .or(provider.default_upstream_model.as_deref())
+                    .unwrap_or("");
+                let upstream_model: String = input("Upstream model")
+                    .default_input(default_upstream)
+                    .validate(|v: &String| {
+                        if v.trim().is_empty() {
+                            Err("required")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .interact()
+                    .map_err(|e| e.to_string())?;
+                mapping_set(&provider_name, &client_model, &upstream_model)?;
+                if let Ok((s, _)) = load_or_migrate(root) {
+                    store = s;
+                }
+                refresh_live_provider_if_active(base, &provider_name).await?;
+            }
+            "status" => {
+                cliclack::log::info(format!(
+                    "store={} active={}",
+                    store_path.display(),
+                    store.active_provider
+                ))
+                .map_err(|e| e.to_string())?;
+                let _ = status(base).await;
+            }
+            "quit" => break,
+            _ => {}
+        }
     }
+
+    outro("Done.").map_err(|e| e.to_string())?;
+    Ok(())
 }
 
-fn select_public_model() -> Result<Option<String>, String> {
-    let models: Vec<String> = PUBLIC_MODELS.iter().map(|m| m.to_string()).collect();
-    select_items("Select public model", &models, None)
-}
-
-fn select_provider(providers: &Value) -> Result<Option<String>, String> {
-    let names: Vec<String> = providers["providers"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|p| p["name"].as_str())
-        .map(str::to_string)
-        .collect();
-    if names.is_empty() {
-        return Err("no providers configured".to_string());
-    }
-    select_items("Select provider", &names, None)
-}
-
-fn select_upstream_model(
-    providers: &Value,
-    provider: &str,
-    default: Option<&str>,
-) -> Result<Option<String>, String> {
-    let models: Vec<String> = providers["providers"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .find(|p| p["name"].as_str() == Some(provider))
-        .map(|p| {
-            p["models"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|m| m["upstream_model"].as_str())
-                .map(str::to_string)
-                .collect()
+fn prompt_provider(existing: Option<&StoredProvider>) -> Result<StoredProvider, String> {
+    let default_name = existing.map(|p| p.name.as_str()).unwrap_or("");
+    let name: String = input("Provider name")
+        .default_input(default_name)
+        .validate(|v: &String| {
+            if v.trim().is_empty() {
+                Err("required")
+            } else {
+                Ok(())
+            }
         })
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+    let base_url: String = input("Base URL")
+        .default_input(existing.map(|p| p.base_url.as_str()).unwrap_or("https://"))
+        .validate(|v: &String| {
+            if !(v.starts_with("http://") || v.starts_with("https://")) {
+                Err("must start with http:// or https://")
+            } else {
+                Ok(())
+            }
+        })
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+    let api_key: String = input("API key")
+        .default_input(existing.map(|p| p.api_key.as_str()).unwrap_or(""))
+        .validate(|v: &String| {
+            if v.trim().is_empty() {
+                Err("required")
+            } else {
+                Ok(())
+            }
+        })
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+    let format = select("Upstream protocol")
+        .initial_value(match existing.map(|p| &p.api_format) {
+            Some(ApiFormat::OpenaiChat) => "chat",
+            Some(ApiFormat::Anthropic) => "anthropic",
+            _ => "responses",
+        })
+        .item(
+            "responses",
+            "OpenAI Responses (passthrough, default)",
+            "no conversion",
+        )
+        .item("chat", "OpenAI Chat Completions", "Responses ⇄ Chat bridge")
+        .item(
+            "anthropic",
+            "Anthropic Messages",
+            "Responses ⇄ Anthropic bridge",
+        )
+        .interact()
+        .map_err(|e| e.to_string())?;
+    let api_format = ApiFormat::parse(format).unwrap_or_default();
+
+    let default_model: String = input("Default upstream model (optional)")
+        .default_input(
+            existing
+                .and_then(|p| p.default_upstream_model.as_deref())
+                .unwrap_or(""),
+        )
+        .interact()
+        .map_err(|e| e.to_string())?;
+    let default_upstream_model = {
+        let t = default_model.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+
+    let mut model_mappings = existing
+        .map(|p| p.model_mappings.clone())
         .unwrap_or_default();
-    if models.is_empty() {
-        return Err(format!("provider '{provider}' has no models"));
-    }
-    let default_idx = default.and_then(|d| models.iter().position(|m| m == d));
-    select_items("Select upstream model", &models, default_idx)
-}
-
-fn select_routed_model(routes: &Value) -> Result<Option<String>, String> {
-    let mut models: Vec<String> = routes["routes"]
-        .as_object()
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
-    if models.is_empty() {
-        return Err("no routes configured".to_string());
-    }
-    models.sort();
-    select_items("Select model to remove", &models, None)
-}
-
-fn current_upstream(routes: &Value, model: &str) -> String {
-    routes["routes"][model]["upstream_model"]
-        .as_str()
-        .unwrap_or("")
-        .to_string()
-}
-
-fn select_items(
-    prompt: &str,
-    items: &[String],
-    default: Option<usize>,
-) -> Result<Option<String>, String> {
-    let mut select = Select::new().with_prompt(prompt).items(items);
-    if let Some(idx) = default {
-        select = select.default(idx);
-    }
-    let idx = select.interact_opt().map_err(|e| e.to_string())?;
-    Ok(idx.and_then(|idx| items.get(idx).cloned()))
-}
-
-fn print_routes(resp: &Value) {
-    println!("routes:");
-    let routes = resp["routes"].as_object();
-    if routes.map(|m| m.is_empty()).unwrap_or(true) {
-        println!("  (empty)");
-        return;
-    }
-    for (model, route) in routes.unwrap() {
-        let provider = route["provider"].as_str().unwrap_or("");
-        let upstream = route["upstream_model"].as_str().unwrap_or("");
-        println!("  {model} -> {provider}/{upstream}");
-    }
-}
-
-async fn get_json(base: &str, path: &str) -> Result<Value, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{base}{path}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = ensure_status(resp).await?;
-    resp.json::<Value>().await.map_err(|e| e.to_string())
-}
-
-async fn put_json(base: &str, path: &str, body: Value) -> Result<Value, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .put(format!("{base}{path}"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = ensure_status(resp).await?;
-    resp.json::<Value>().await.map_err(|e| e.to_string())
-}
-
-async fn delete_json(base: &str, path: &str) -> Result<Value, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .delete(format!("{base}{path}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = ensure_status(resp).await?;
-    resp.json::<Value>().await.map_err(|e| e.to_string())
-}
-
-async fn ensure_status(resp: reqwest::Response) -> Result<reqwest::Response, String> {
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp);
-    }
-    let body = resp.text().await.unwrap_or_default();
-    Err(format!("HTTP {status}: {body}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn esc_from_upstream_model_returns_to_provider() {
-        let step = InteractiveStep::UpstreamModel {
-            public_model: "gpt-5.6-luna".to_string(),
-            provider: "ada".to_string(),
-            provider_can_return_to_model: true,
-        };
-
-        assert_eq!(
-            previous_step(step),
-            Some(InteractiveStep::Provider {
-                public_model: "gpt-5.6-luna".to_string(),
-                can_return_to_model: true,
-            })
-        );
+    if let Some(m) = default_upstream_model.as_ref() {
+        model_mappings.entry(m.clone()).or_insert_with(|| m.clone());
     }
 
-    #[test]
-    fn esc_from_provider_in_wizard_returns_to_public_model() {
-        let step = InteractiveStep::Provider {
-            public_model: "gpt-5.6-terra".to_string(),
-            can_return_to_model: true,
-        };
-
-        assert_eq!(previous_step(step), Some(InteractiveStep::PublicModel));
-    }
-
-    #[test]
-    fn esc_from_public_model_exits_wizard() {
-        assert_eq!(previous_step(InteractiveStep::PublicModel), None);
-    }
-
-    #[test]
-    fn esc_from_provider_for_fixed_public_model_exits_command() {
-        let step = InteractiveStep::Provider {
-            public_model: "gpt-5.6-sol".to_string(),
-            can_return_to_model: false,
-        };
-
-        assert_eq!(previous_step(step), None);
-    }
+    Ok(StoredProvider {
+        name: name.trim().to_string(),
+        base_url: base_url.trim().trim_end_matches('/').to_string(),
+        api_key: api_key.trim().to_string(),
+        api_format,
+        default_upstream_model,
+        model_mappings,
+        max_output_tokens: existing.and_then(|p| p.max_output_tokens),
+    })
 }

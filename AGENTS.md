@@ -2,47 +2,59 @@
 
 ## Project Structure & Module Organization
 
-This repository is a Rust 2024 compatibility layer for a personal LLM provider. It maps public models to provider deployments and adapts provider request/response formats, including SSE. The entry point and routes are in `src/main.rs`; reusable adaptation logic is exposed from `src/lib.rs`. Keep related behavior in focused modules:
+This repository is a Rust 2024 Codex-oriented local LLM proxy. It takes over Codex `base_url` + `auth.json` while running, forwards `/v1/responses` (+ compact), and bridges three upstream API formats back to the OpenAI Responses shape Codex expects. Entry point and routes are in `src/main.rs`; library surface is `src/lib.rs`.
 
-- `src/model.rs`: public-to-upstream model routing and model list generation.
-- `src/request.rs` and `src/response.rs`: request/response normalization.
-- `src/channel/`: upstream-specific adaptations, including DeepSeek, GLM, and standard channels.
-- `src/sse.rs`: streaming response rewriting.
-- `src/exchange.rs`: request/response exchange logging.
-- `config.toml`: local provider, credential, model mapping, adapter, and compact capability configuration (gitignored; copy from `config.example.toml`).
-- `config.example.toml`: committed template without real credentials.
+- `src/config.rs`: TOML config (`active_provider`, `[[providers]]` with `api_format` / `upstream_model`).
+- `src/codex_live.rs`: apply/restore of Codex `base_url`, forced `wire_api = "responses"`, and `OPENAI_API_KEY` placeholder.
+- `src/proxy/`: protocol bridges ported from cc-switch (Responses / Chat Completions / Anthropic Messages, SSE rewriting).
+- `src/exchange.rs`: request/response exchange logging under `.run/`.
+- `config.toml`: local credentials (gitignored; copy from `config.example.toml`).
 
 ## Architecture & Provider Configuration
 
-Load provider definitions from TOML rather than hard-coding deployment settings. Support multiple providers and one or more models per provider; each model names a built-in Rust response adapter, while compact capability belongs to the provider. Runtime routing uses a persisted route table under `.run/routes.json`, seeded from `default_provider` at startup and adjustable at runtime through the admin endpoints. `/v1/models` and request routing expose the public model names that currently have a route. Reference adapters by stable names; do not add executable configuration hooks. Runtime files belong under `.run/`, which is ignored by Git.
+Configure one active provider and a list of providers in TOML. Codex only sees the local proxy (Responses wire). The proxy selects the real upstream via `active_provider` (hot-switchable). Supported `api_format` values:
+
+- `openai_responses` — passthrough Responses upstream (`/responses`, `/responses/compact`)
+- `openai_chat` — Responses ⇄ Chat Completions (including Compact → `/chat/completions`)
+- `anthropic` — Responses ⇄ Anthropic Messages (including Compact → `/v1/messages`)
+
+Compact is always accepted on the local entry (same as cc-switch) and follows the active provider's native Responses passthrough or protocol bridge.
+
+Hot-switch without restarting Codex:
+
+```bash
+./llpx providers
+./llpx use mmkg-chat
+```
+
+or `POST /v1/admin/active` with `{"name":"..."}` (also persists the active provider in the JSON store).
+
+Runtime files belong under `.run/` (gitignored). `./start.sh` applies Codex live takeover (`base_url` + `wire_api=responses` + auth placeholder); `./stop.sh` restores it. Set `LLPX_SKIP_CODEX_LIVE=1` to skip takeover.
 
 ## Build, Test, and Development Commands
 
-Run these from the repository root:
-
 ```bash
 cargo build                 # Build the debug proxy binary
-cargo test                  # Run unit tests embedded in src modules
+cargo test                  # Run unit tests
 cargo fmt --check           # Verify Rust formatting
 cargo clippy --all-targets  # Run Rust lints
-./start.sh                  # Build and start locally on 127.0.0.1:8787
-./stop.sh                   # Stop the proxy and clear exchange logs
-./llpx list                 # List providers and routes
-./llpx set <public_model> <provider> <upstream_model>    # Set a route
-./llpx unset <public_model> # Remove a route
+./start.sh                  # Build, apply Codex live config, listen on 127.0.0.1:8787
+./stop.sh                   # Restore Codex config and stop the proxy
+./llpx status               # Show proxy health / active provider
+./llpx providers            # List configured providers
+./llpx use <name>           # Hot-switch active upstream provider
 ```
 
-`./start.sh` builds the proxy and copies the `llpx` binary to the repository root for local use. It loads `CONFIG_PATH` (default `config.toml`). Keep endpoints, `api_key`, `default_provider`, model mappings, adapter names, and `supports_compact` in the local (gitignored) `config.toml`. Copy `config.example.toml` to `config.toml` and fill in credentials. Optional `BIND_ADDR` / `EXCHANGE_LOG_DIR` env vars still override TOML. `./llpx` resolves the proxy base via `--base`, `LLPX_BASE`, or `PROXY_BASE` (default `http://127.0.0.1:8787`) and drives the admin route endpoints (`/v1/admin/providers` and `/v1/admin/routes`).
+Load `CONFIG_PATH` (default `config.toml`). Optional `BIND_ADDR` / `EXCHANGE_LOG_DIR` override TOML. Some upstreams (e.g. Cloudflare) require a Codex-like `User-Agent`; the proxy sets a default when missing.
 
 ## Coding Style & Naming Conventions
 
-Use `rustfmt` defaults, four-space indentation, idiomatic Rust naming (`snake_case` functions/modules, `UpperCamelCase` types, `SCREAMING_SNAKE_CASE` constants), and explicit small helpers for JSON transformations. Preserve channel-specific behavior behind the existing `ChannelKind`/`UpstreamChannel` boundary. Keep comments focused on non-obvious protocol quirks.
+Use `rustfmt` defaults, four-space indentation, idiomatic Rust naming, and small helpers for JSON transforms. Keep protocol quirks documented near the bridge code. Prefer extending `src/proxy/` over reintroducing the old channel/adapter route table.
 
 ## Testing Guidelines
 
-Use Rust's built-in test framework with `#[cfg(test)]` modules colocated beside the code they exercise. Name tests by behavior, such as `restores_internal_deployment_ids_in_split_sse_events`. Add regression tests for each request, response, compact fallback, or SSE transformation change, then run `cargo test`.
+Use `#[cfg(test)]` modules colocated with the code they exercise. Name tests by behavior. Add regression coverage for each request/response/SSE bridge change, then run `cargo test`.
 
 ## Commit & Pull Request Guidelines
 
-Follow the concise Conventional Commit style already present in history, for example `feat: add ...` or `fix: handle ...`. Keep commits focused. Pull requests should explain the protocol or configuration impact, list validation commands run, link the relevant issue or task, and include request/response examples when API behavior changes. Do not commit API keys, `config.toml`, `.env`, `.run/`, or generated logs.
-
+Follow Conventional Commits (`feat:`, `fix:`, …). Do not commit API keys, `config.toml`, `.env`, `.run/`, or generated logs.

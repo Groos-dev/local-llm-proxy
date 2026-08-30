@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 RUN_DIR="$ROOT/.run"
 PID_FILE="$RUN_DIR/local-llm-proxy.pid"
+BACKUP_FILE="${LLPX_CODEX_BACKUP:-$RUN_DIR/codex-live-backup.json}"
 
 if [[ -f "$ROOT/.env" ]]; then
   set -a
@@ -44,6 +45,14 @@ if command -v lsof >/dev/null 2>&1; then
     echo "stopped listener pid=$pid port=$port"
     stopped=1
   done
+fi
+
+if [[ -f "$BACKUP_FILE" ]]; then
+  if [[ ! -x "$ROOT/target/debug/local-llm-proxy" ]]; then
+    cargo build -q --bin local-llm-proxy
+  fi
+  LLPX_RESTORE_CODEX_LIVE=1 LLPX_CODEX_BACKUP="$BACKUP_FILE" \
+    "$ROOT/target/debug/local-llm-proxy"
 fi
 
 if [[ "$stopped" -eq 0 ]]; then

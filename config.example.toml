@@ -1,65 +1,30 @@
 bind_addr = "127.0.0.1:8787"
 exchange_log_dir = ".run/exchanges"
-default_provider = "passthrough-a"
+active_provider = "responses-example"
 
+# Upstream speaks OpenAI Responses (passthrough, including /responses/compact).
 [[providers]]
-name = "mapped"
-base_url = "https://provider-a.example/v1"
+name = "responses-example"
+base_url = "https://api.openai.com/v1"
 api_key = "replace-me"
-supports_compact = false
+api_format = "openai_responses"
+upstream_model = "gpt-5.4"
 
-[[providers.models]]
-upstream_model = "upstream-flash"
-response_adapter = "deepseek"
-
-[[providers.models]]
-upstream_model = "upstream-pro"
-response_adapter = "deepseek"
-
-[[providers.models]]
-upstream_model = "upstream-sol"
-response_adapter = "glm"
-
+# Upstream speaks OpenAI Chat Completions.
+# Compact is bridged to /chat/completions (same as cc-switch).
 [[providers]]
-name = "passthrough-a"
-base_url = "https://provider-b.example/v1"
+name = "chat-example"
+base_url = "https://api.example.com/v1"
 api_key = "replace-me"
-supports_compact = true
+api_format = "openai_chat"
+upstream_model = "gpt-4o"
 
-[[providers.models]]
-upstream_model = "gpt-5.6"
-response_adapter = "standard"
-
-[[providers.models]]
-upstream_model = "gpt-5.6-luna"
-response_adapter = "standard"
-
-[[providers.models]]
-upstream_model = "gpt-5.6-sol"
-response_adapter = "standard"
-
-[[providers.models]]
-upstream_model = "gpt-5.6-terra"
-response_adapter = "standard"
-
+# Upstream speaks Anthropic Messages.
+# Compact is bridged to /v1/messages (same as cc-switch).
 [[providers]]
-name = "passthrough-b"
-base_url = "https://provider-c.example/v1"
+name = "anthropic-example"
+base_url = "https://api.anthropic.com"
 api_key = "replace-me"
-supports_compact = true
-
-[[providers.models]]
-upstream_model = "gpt-5.6"
-response_adapter = "standard"
-
-[[providers.models]]
-upstream_model = "gpt-5.6-luna"
-response_adapter = "standard"
-
-[[providers.models]]
-upstream_model = "gpt-5.6-sol"
-response_adapter = "standard"
-
-[[providers.models]]
-upstream_model = "gpt-5.6-terra"
-response_adapter = "standard"
+api_format = "anthropic"
+upstream_model = "claude-sonnet-4-6"
+# max_output_tokens = 16384

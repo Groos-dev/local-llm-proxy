@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 RUN_DIR="$ROOT/.run"
 PID_FILE="$RUN_DIR/local-llm-proxy.pid"
 LOG_FILE="$RUN_DIR/local-llm-proxy.log"
+BACKUP_FILE="${LLPX_CODEX_BACKUP:-$RUN_DIR/codex-live-backup.json}"
 
 cd "$ROOT"
 
@@ -16,6 +17,14 @@ if [[ -f "$ROOT/.env" ]]; then
 fi
 
 export CONFIG_PATH="${CONFIG_PATH:-$ROOT/config.toml}"
+# Prefer JSON store (llpx configure / provider upsert). Falls back to migrating TOML.
+if [[ -z "${LLPX_STORE:-}" ]]; then
+  if [[ -f "$HOME/.llpx/store.json" ]]; then
+    export LLPX_STORE="$HOME/.llpx/store.json"
+  elif [[ -f "$RUN_DIR/llpx-store.json" ]]; then
+    export LLPX_STORE="$RUN_DIR/llpx-store.json"
+  fi
+fi
 if [[ -n "${BIND_ADDR:-}" ]]; then
   export BIND_ADDR
 fi
@@ -45,19 +54,28 @@ cp "$ROOT/target/debug/llpx" "$ROOT/llpx"
 chmod +x "$ROOT/llpx"
 
 export EXCHANGE_LOG_DIR="${EXCHANGE_LOG_DIR:-$RUN_DIR/exchanges}"
-export ROUTES_PATH="${ROUTES_PATH:-$RUN_DIR/routes.json}"
+proxy_base="http://${bind_addr}/v1"
+
+if [[ "${LLPX_SKIP_CODEX_LIVE:-}" != "1" ]]; then
+  export LLPX_APPLY_CODEX_LIVE=1
+  export LLPX_CODEX_BACKUP="$BACKUP_FILE"
+  export LLPX_PROXY_BASE="$proxy_base"
+else
+  unset LLPX_APPLY_CODEX_LIVE LLPX_CODEX_BACKUP LLPX_PROXY_BASE || true
+fi
+
 nohup "$ROOT/target/debug/local-llm-proxy" >"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
 
 host="${bind_addr%:*}"
 port="${bind_addr##*:}"
 for _ in $(seq 1 40); do
-  if curl -sS -m 1 "http://${host}:${port}/v1/models" >/dev/null 2>&1; then
+  if curl -sS -m 1 "http://${host}:${port}/health" >/dev/null 2>&1; then
     echo "started pid=$(cat "$PID_FILE") bind=$bind_addr log=$LOG_FILE exchanges=$EXCHANGE_LOG_DIR"
     exit 0
   fi
   sleep 0.15
 done
 
-echo "started but /v1/models not ready yet; pid=$(cat "$PID_FILE") log=$LOG_FILE" >&2
+echo "started but /health not ready yet; pid=$(cat "$PID_FILE") log=$LOG_FILE" >&2
 exit 1
