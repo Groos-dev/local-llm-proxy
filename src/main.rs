@@ -529,7 +529,6 @@ async fn send_json(
             );
         }
     }
-    req = req.header(header::CONTENT_TYPE, "application/json");
     // Some gateways (Cloudflare) reject bare library UAs; prefer Codex client UA.
     let ua = client_headers
         .get(header::USER_AGENT)
