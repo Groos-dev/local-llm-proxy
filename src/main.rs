@@ -96,17 +96,6 @@ impl AppState {
 async fn main() {
     let _ = env_logger::try_init();
 
-    // One-shot Codex live takeover helpers used by start.sh / stop.sh.
-    if env::var_os("LLPX_RESTORE_CODEX_LIVE").is_some() {
-        let backup = env::var_os("LLPX_CODEX_BACKUP")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".run/codex-live-backup.json"));
-        local_llm_proxy::codex_live::restore_takeover(&backup)
-            .unwrap_or_else(|err| panic!("restore Codex live config failed: {err}"));
-        eprintln!("restored Codex live config from {}", backup.display());
-        return;
-    }
-
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let toml_path = env::var_os("CONFIG_PATH")
         .map(PathBuf::from)
@@ -132,24 +121,9 @@ async fn main() {
     let (active_name, providers) = store
         .into_providers()
         .unwrap_or_else(|err| panic!("invalid provider configuration: {err}"));
-    let proxy_base = format!("http://{bind_addr}/v1");
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .unwrap_or_else(|err| panic!("failed to bind {bind_addr}: {err}"));
-
-    if env::var_os("LLPX_APPLY_CODEX_LIVE").is_some() {
-        let backup = env::var_os("LLPX_CODEX_BACKUP")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".run/codex-live-backup.json"));
-        let base = env::var("LLPX_PROXY_BASE").unwrap_or_else(|_| proxy_base.clone());
-        local_llm_proxy::codex_live::apply_takeover(&base, &backup)
-            .unwrap_or_else(|err| panic!("apply Codex live config failed: {err}"));
-        eprintln!(
-            "applied Codex live takeover base_url={base} wire_api=responses backup={}",
-            backup.display()
-        );
-        // Continue into server listen after apply.
-    }
 
     let runtime = RuntimeProviders {
         store_path: store_path.clone(),
@@ -555,7 +529,6 @@ async fn send_json(
             );
         }
     }
-    req = req.header(header::CONTENT_TYPE, "application/json");
     // Some gateways (Cloudflare) reject bare library UAs; prefer Codex client UA.
     let ua = client_headers
         .get(header::USER_AGENT)
@@ -743,11 +716,21 @@ fn join_url(base: &str, path: &str) -> String {
     } else {
         format!("/{path}")
     };
-    // Avoid /v1/v1 when base already ends with /v1 and path starts with /v1
-    if base.ends_with("/v1") && path.starts_with("/v1/") {
-        return format!("{}{}", base.trim_end_matches("/v1"), path);
+    // Match cc-switch: an origin-only base URL uses the provider's /v1 API prefix.
+    let origin_only = reqwest::Url::parse(base)
+        .ok()
+        .is_some_and(|url| matches!(url.path(), "" | "/"));
+    let mut url = if base.ends_with("/v1") && path.starts_with("/v1/") {
+        format!("{}{}", base.trim_end_matches("/v1"), path)
+    } else if origin_only && path != "/v1" && !path.starts_with("/v1/") {
+        format!("{base}/v1{path}")
+    } else {
+        format!("{base}{path}")
+    };
+    while url.contains("/v1/v1") {
+        url = url.replace("/v1/v1", "/v1");
     }
-    format!("{base}{path}")
+    url
 }
 
 #[cfg(test)]
@@ -778,6 +761,38 @@ mod tests {
     }
 
     #[test]
+    fn join_url_matches_cc_switch_codex_url_rules() {
+        assert_eq!(
+            join_url("https://api.example.com", "/responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/", "responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1", "/responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1", "/v1/responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/openai", "/responses"),
+            "https://api.example.com/openai/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com", "/v1/messages"),
+            "https://api.example.com/v1/messages"
+        );
+        assert_eq!(
+            join_url("https://api.example.com", "/v1/v1/responses"),
+            "https://api.example.com/v1/responses"
+        );
+    }
+
+    #[test]
     fn hot_switch_reloads_provider_config_from_store() {
         use local_llm_proxy::StoredProvider;
         use std::{collections::BTreeMap, fs};
@@ -804,6 +819,7 @@ mod tests {
             version: 1,
             bind_addr: None,
             exchange_log_dir: None,
+            codex_active: true,
             active_provider: "a".into(),
             providers: vec![provider("a", "model-a")],
         };
@@ -819,6 +835,7 @@ mod tests {
             version: 1,
             bind_addr: None,
             exchange_log_dir: None,
+            codex_active: true,
             active_provider: "a".into(),
             providers: vec![provider("a", "model-a"), provider("b", "model-b")],
         };

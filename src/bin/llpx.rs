@@ -1,20 +1,29 @@
-//! llpx — Clack-style wizard + headless CLI for local-llm-proxy.
+//! llpx — Hierarchical TUI + headless CLI for local-llm-proxy.
 
-use cliclack::{confirm, input, intro, outro, select, spinner};
+use cliclack::{input, select, spinner};
 use local_llm_proxy::{
-    ApiFormat, LlpxStore, StoredProvider, default_store_path, load_runtime,
+    ApiFormat, LlpxStore, StoredProvider, codex_live, default_store_path, load_runtime,
     models_fetch::fetch_model_ids,
 };
-use std::{collections::BTreeMap, env, path::PathBuf, process, process::Command};
+use std::{
+    collections::BTreeMap,
+    env,
+    fs::{self, OpenOptions},
+    net::{SocketAddr, TcpStream},
+    path::{Path, PathBuf},
+    process::{self, Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 const USAGE: &str = "\n\
 Usage:\n\
-  llpx                      Interactive configure wizard (cliclack)\n\
-  llpx configure            Same as interactive wizard\n\
+  llpx                      Interactive hierarchical TUI\n\
+  llpx configure            Open the same interactive TUI\n\
   llpx status               Proxy health\n\
   llpx providers            List providers (store + live)\n\
   llpx use <name>           Hot-switch active provider\n\
-  llpx start                Start proxy + Codex live takeover\n\
+  llpx start                Start proxy (Codex takeover when ACTIVE)\n\
   llpx stop                 Stop proxy + restore Codex\n\
   llpx provider upsert ...  Non-interactive provider write\n\
   llpx models sync <name>   Fetch /v1/models + identity mappings\n\
@@ -50,10 +59,10 @@ async fn main() {
                 eprint!("missing provider name\n{USAGE}");
                 process::exit(1);
             }
-            use_provider(&base, &name).await
+            use_provider(&base, &name, false).await
         }
-        Some("start") => start_proxy(&root),
-        Some("stop") => stop_proxy(&root),
+        Some("start") => start_proxy(&root, false),
+        Some("stop") => stop_proxy(&root, false),
         Some("provider") => match args.get(1).map(String::as_str) {
             Some("upsert") => provider_upsert(&args[2..]),
             _ => {
@@ -70,8 +79,8 @@ async fn main() {
                     eprint!("usage: llpx models sync <provider-name>\n");
                     process::exit(1);
                 }
-                match models_sync(&name).await {
-                    Ok(()) => refresh_live_provider_if_active(&base, &name).await,
+                match models_sync(&name, false).await {
+                    Ok(()) => refresh_live_provider_if_active(&base, &name, false).await,
                     Err(err) => Err(err),
                 }
             }
@@ -81,10 +90,12 @@ async fn main() {
             }
         },
         Some("mapping") => match args.get(1).map(String::as_str) {
-            Some("set") if args.len() == 5 => match mapping_set(&args[2], &args[3], &args[4]) {
-                Ok(()) => refresh_live_provider_if_active(&base, &args[2]).await,
-                Err(err) => Err(err),
-            },
+            Some("set") if args.len() == 5 => {
+                match mapping_set(&args[2], &args[3], &args[4], false) {
+                    Ok(()) => refresh_live_provider_if_active(&base, &args[2], false).await,
+                    Err(err) => Err(err),
+                }
+            }
             _ => {
                 eprint!("usage: llpx mapping set <provider> <client-model> <upstream-model>\n");
                 process::exit(1);
@@ -161,6 +172,7 @@ async fn providers_cmd(base: &str) -> Result<(), String> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "active": store.active_provider,
+            "codex_active": store.codex_active,
             "providers": store.providers.iter().map(|p| serde_json::json!({
                 "name": p.name,
                 "api_format": p.api_format.as_str(),
@@ -185,12 +197,14 @@ async fn providers_cmd(base: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn use_provider(base: &str, name: &str) -> Result<(), String> {
+async fn use_provider(base: &str, name: &str, quiet: bool) -> Result<(), String> {
     let root = repo_root();
     let (mut store, path) = load_or_migrate(&root)?;
     store.set_active(name).map_err(|e| e.to_string())?;
     store.save(&path).map_err(|e| e.to_string())?;
-    println!("store active → {name} ({})", path.display());
+    if !quiet {
+        println!("store active → {name} ({})", path.display());
+    }
 
     let client = reqwest::Client::new();
     match client
@@ -202,44 +216,230 @@ async fn use_provider(base: &str, name: &str) -> Result<(), String> {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            println!("live: {status}");
-            println!("{body}");
+            if !quiet {
+                println!("live: {status}");
+                println!("{body}");
+            }
             if !status.is_success() {
                 return Err(format!("live provider switch failed: {status}"));
             }
         }
         Err(err) => {
-            println!("note: store updated; proxy not reachable ({err})");
+            if !quiet {
+                println!("note: store updated; proxy not reachable ({err})");
+            }
         }
     }
     Ok(())
 }
 
-fn start_proxy(root: &PathBuf) -> Result<(), String> {
-    // Ensure store exists (migrate toml if needed) before start.sh loads config.
-    let (_, store_path) = load_or_migrate(root)?;
-    println!("using store {}", store_path.display());
-    // Point proxy at JSON store.
-    let status = Command::new(root.join("start.sh"))
+fn start_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
+    let (store, store_path) = load_or_migrate(root)?;
+    let run_dir = root.join(".run");
+    fs::create_dir_all(&run_dir).map_err(|e| format!("create {}: {e}", run_dir.display()))?;
+    let pid_path = run_dir.join("local-llm-proxy.pid");
+    if let Some(pid) = read_pid(&pid_path)? {
+        if process_alive(pid) {
+            if !quiet {
+                println!("already running pid={pid}");
+            }
+            return Ok(());
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+
+    let exchange_dir = env::var_os("EXCHANGE_LOG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| store.exchange_log_dir.clone().map(PathBuf::from))
+        .unwrap_or_else(|| run_dir.join("exchanges"));
+    let bind_addr = env::var("BIND_ADDR")
+        .ok()
+        .or(store.bind_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:8787".into());
+    let socket_addr: SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| format!("invalid bind address {bind_addr}: {e}"))?;
+    clear_dir(&exchange_dir)?;
+    fs::create_dir_all(&exchange_dir)
+        .map_err(|e| format!("create {}: {e}", exchange_dir.display()))?;
+
+    let log_path = run_dir.join("local-llm-proxy.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&log_path)
+        .map_err(|e| format!("open {}: {e}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| format!("clone {}: {e}", log_path.display()))?;
+
+    let binary = root.join("target/debug/local-llm-proxy");
+    ensure_proxy_binary(root, &binary)?;
+
+    let backup_path = env::var_os("LLPX_CODEX_BACKUP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| codex_live::default_backup_path(&run_dir));
+    if store.codex_active && env::var("LLPX_SKIP_CODEX_LIVE").as_deref() != Ok("1") {
+        codex_live::apply_takeover(&format!("http://{bind_addr}/v1"), &backup_path)
+            .map_err(|e| format!("apply Codex live config failed: {e}"))?;
+    }
+    let child = Command::new("nohup")
+        .arg(&binary)
         .current_dir(root)
         .env("LLPX_STORE", &store_path)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!("start.sh exited {status}"));
+        .env("EXCHANGE_LOG_DIR", &exchange_dir)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .map_err(|e| format!("start {}: {e}", binary.display()))?;
+    let pid = child.id();
+    fs::write(&pid_path, format!("{pid}\n"))
+        .map_err(|e| format!("write {}: {e}", pid_path.display()))?;
+
+    for _ in 0..40 {
+        if TcpStream::connect_timeout(&socket_addr, Duration::from_secs(1)).is_ok() {
+            if !quiet {
+                println!(
+                    "started pid={pid} bind={bind_addr} log={} exchanges={}",
+                    log_path.display(),
+                    exchange_dir.display()
+                );
+            }
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    Err(format!(
+        "started but proxy is not listening on {bind_addr}; pid={pid} log={}",
+        log_path.display()
+    ))
+}
+
+fn stop_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
+    let run_dir = root.join(".run");
+    let pid_path = run_dir.join("local-llm-proxy.pid");
+    let runtime_store = load_or_migrate(root).ok().map(|(store, _)| store);
+    let mut stopped = false;
+    if let Some(pid) = read_pid(&pid_path)? {
+        if process_alive(pid) {
+            terminate(pid);
+            if !quiet {
+                println!("stopped pid={pid}");
+            }
+            stopped = true;
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+
+    if let Some(bind_addr) = env::var("BIND_ADDR")
+        .ok()
+        .or_else(|| runtime_store.as_ref().and_then(|s| s.bind_addr.clone()))
+    {
+        if let Ok(port) = bind_addr
+            .rsplit(':')
+            .next()
+            .unwrap_or_default()
+            .parse::<u16>()
+        {
+            if let Ok(output) = Command::new("lsof")
+                .args(["-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+                .output()
+            {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        terminate(pid);
+                        if !quiet {
+                            println!("stopped listener pid={pid} port={port}");
+                        }
+                        stopped = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let backup_path = env::var_os("LLPX_CODEX_BACKUP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| codex_live::default_backup_path(&run_dir));
+    codex_live::restore_takeover(&backup_path)
+        .map_err(|e| format!("restore Codex live config failed: {e}"))?;
+
+    let exchange_dir = env::var_os("EXCHANGE_LOG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            runtime_store
+                .as_ref()
+                .and_then(|s| s.exchange_log_dir.clone().map(PathBuf::from))
+        })
+        .unwrap_or_else(|| run_dir.join("exchanges"));
+    clear_dir(&exchange_dir)?;
+    if !stopped {
+        if !quiet {
+            println!("not running");
+        }
+    }
+    if !quiet {
+        println!("cleared {}", exchange_dir.display());
     }
     Ok(())
 }
 
-fn stop_proxy(root: &PathBuf) -> Result<(), String> {
-    let status = Command::new(root.join("stop.sh"))
+fn ensure_proxy_binary(root: &Path, binary: &Path) -> Result<(), String> {
+    let status = Command::new("cargo")
         .current_dir(root)
+        .args(["build", "-q", "--bin", "local-llm-proxy"])
         .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!("stop.sh exited {status}"));
+        .map_err(|e| format!("build local-llm-proxy: {e}"))?;
+    if status.success() && binary.exists() {
+        Ok(())
+    } else {
+        Err(format!("build local-llm-proxy exited {status}"))
+    }
+}
+
+fn clear_dir(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_dir_all(path).map_err(|e| format!("clear {}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+fn read_pid(path: &Path) -> Result<Option<u32>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    text.trim()
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|e| format!("invalid pid file {}: {e}", path.display()))
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn terminate(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
+    for _ in 0..20 {
+        if !process_alive(pid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn provider_upsert(args: &[String]) -> Result<(), String> {
@@ -315,7 +515,7 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-async fn models_sync(name: &str) -> Result<(), String> {
+async fn models_sync(name: &str, quiet: bool) -> Result<(), String> {
     let root = repo_root();
     let (mut store, path) = load_or_migrate(&root)?;
     let provider = store
@@ -327,25 +527,35 @@ async fn models_sync(name: &str) -> Result<(), String> {
     let ids = fetch_model_ids(&provider)
         .await
         .map_err(|e| e.to_string())?;
-    spin.stop(format!("found {} models", ids.len()));
+    if quiet {
+        spin.clear();
+    } else {
+        spin.stop(format!("found {} models", ids.len()));
+    }
     let p = store
         .get_mut(name)
         .ok_or_else(|| format!("provider '{name}' missing"))?;
     p.apply_identity_mappings_from_models(&ids);
     store.save(&path).map_err(|e| e.to_string())?;
-    println!(
-        "synced identity mappings for '{name}' ({} entries) → {}",
-        store.get(name).map(|p| p.model_mappings.len()).unwrap_or(0),
-        path.display()
-    );
+    if !quiet {
+        println!(
+            "synced identity mappings for '{name}' ({} entries) → {}",
+            store.get(name).map(|p| p.model_mappings.len()).unwrap_or(0),
+            path.display()
+        );
+    }
     Ok(())
 }
 
-async fn refresh_live_provider_if_active(base: &str, name: &str) -> Result<(), String> {
+async fn refresh_live_provider_if_active(
+    base: &str,
+    name: &str,
+    quiet: bool,
+) -> Result<(), String> {
     let root = repo_root();
     let (store, _) = load_or_migrate(&root)?;
     if store.active_provider == name {
-        use_provider(base, name).await?;
+        use_provider(base, name, quiet).await?;
     }
     Ok(())
 }
@@ -354,6 +564,7 @@ fn mapping_set(
     provider_name: &str,
     client_model: &str,
     upstream_model: &str,
+    quiet: bool,
 ) -> Result<(), String> {
     if client_model.trim().is_empty() || upstream_model.trim().is_empty() {
         return Err("model names must not be empty".into());
@@ -367,15 +578,16 @@ fn mapping_set(
         .model_mappings
         .insert(client_model.trim().into(), upstream_model.trim().into());
     store.save(&path).map_err(|e| e.to_string())?;
-    println!(
-        "mapped {client_model} -> {upstream_model} for '{provider_name}' ({})",
-        path.display()
-    );
+    if !quiet {
+        println!(
+            "mapped {client_model} -> {upstream_model} for '{provider_name}' ({})",
+            path.display()
+        );
+    }
     Ok(())
 }
 
 async fn run_wizard(base: &str, root: &PathBuf) -> Result<(), String> {
-    intro("local-llm-proxy").map_err(|e| e.to_string())?;
     let (mut store, store_path) = match load_or_migrate(root) {
         Ok(v) => v,
         Err(_) => {
@@ -387,175 +599,323 @@ async fn run_wizard(base: &str, root: &PathBuf) -> Result<(), String> {
     };
 
     loop {
-        let action = select("What do you want to do?")
-            .item("start", "Start proxy (Codex live takeover)", "")
-            .item("stop", "Stop proxy (restore Codex)", "")
-            .item("switch", "Hot-switch active provider", "")
-            .item("add", "Add provider", "")
-            .item("edit", "Edit provider", "")
-            .item("sync", "Sync models (/v1/models → identity map)", "")
-            .item("mapping", "Edit model mapping", "")
-            .item("status", "Show status", "")
-            .item("quit", "Quit", "")
-            .interact()
-            .map_err(|e| e.to_string())?;
+        clear_tui();
+        let codex_status = if store.codex_active {
+            "ACTIVE"
+        } else {
+            "INACTIVE"
+        };
+        let action = select(format!(
+            "LLPX\nSelect a coding client · Codex config {codex_status}"
+        ))
+        .item(
+            "codex",
+            "Codex",
+            format!("{codex_status} · provider {}", store.active_provider),
+        )
+        .item("claude", "Claude Code", "integration not configured")
+        .item("quit", "Quit", "")
+        .interact()
+        .map_err(|e| e.to_string())?;
 
         match action {
-            "start" => {
-                store.save(&store_path).map_err(|e| e.to_string())?;
-                start_proxy(root)?;
-            }
-            "stop" => stop_proxy(root)?,
-            "switch" => {
-                if store.providers.is_empty() {
-                    cliclack::log::warning("No providers yet — add one first.")
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                let mut sel = select("Active provider");
-                for p in &store.providers {
-                    let hint = format!("{} · {}", p.api_format.as_str(), p.base_url);
-                    sel = sel.item(p.name.as_str(), p.name.as_str(), hint);
-                }
-                let name = sel.interact().map_err(|e| e.to_string())?.to_string();
-                store.set_active(&name).map_err(|e| e.to_string())?;
-                store.save(&store_path).map_err(|e| e.to_string())?;
-                use_provider(base, &name).await?;
-            }
-            "add" => {
-                let provider = prompt_provider(None)?;
-                let name = provider.name.clone();
-                store.upsert_provider(provider);
-                if confirm(format!("Set '{name}' as active provider?"))
-                    .initial_value(true)
-                    .interact()
-                    .map_err(|e| e.to_string())?
-                {
-                    store.set_active(&name).map_err(|e| e.to_string())?;
-                }
-                store.save(&store_path).map_err(|e| e.to_string())?;
-                if store.active_provider == name {
-                    use_provider(base, &name).await?;
-                }
-                cliclack::log::success(format!("Saved {name} → {}", store_path.display()))
-                    .map_err(|e| e.to_string())?;
-
-                if confirm("Fetch /v1/models and seed identity mappings now?")
-                    .initial_value(true)
-                    .interact()
-                    .map_err(|e| e.to_string())?
-                {
-                    let _ = models_sync(&name).await.map_err(|e| {
-                        let _ = cliclack::log::warning(format!("models sync failed: {e}"));
-                        e
-                    });
-                    // reload after sync
-                    if let Ok((s, _)) = load_or_migrate(root) {
-                        store = s;
-                    }
-                }
-            }
-            "edit" => {
-                if store.providers.is_empty() {
-                    cliclack::log::warning("No providers yet — add one first.")
-                        .map_err(|e| e.to_string())?;
-                    continue;
-                }
-                let mut sel = select("Provider to edit");
-                for p in &store.providers {
-                    let hint = format!("{} · {}", p.api_format.as_str(), p.base_url);
-                    sel = sel.item(p.name.as_str(), p.name.as_str(), hint);
-                }
-                let selected = sel.interact().map_err(|e| e.to_string())?.to_string();
-                let existing = store.get(&selected).cloned().unwrap();
-                let provider = prompt_provider(Some(&existing))?;
-                let name = provider.name.clone();
-                store
-                    .rename_provider(&selected, provider)
-                    .map_err(|e| e.to_string())?;
-                store.save(&store_path).map_err(|e| e.to_string())?;
-                if store.active_provider == name {
-                    use_provider(base, &name).await?;
-                }
-                cliclack::log::success(format!("Saved {name} → {}", store_path.display()))
-                    .map_err(|e| e.to_string())?;
-            }
-            "sync" => {
-                if store.providers.is_empty() {
-                    cliclack::log::warning("No providers yet.").map_err(|e| e.to_string())?;
-                    continue;
-                }
-                let mut sel = select("Provider to sync");
-                for p in &store.providers {
-                    sel = sel.item(p.name.as_str(), p.name.as_str(), p.base_url.as_str());
-                }
-                let name = sel.interact().map_err(|e| e.to_string())?.to_string();
-                models_sync(&name).await?;
-                if let Ok((s, _)) = load_or_migrate(root) {
-                    store = s;
-                }
-                refresh_live_provider_if_active(base, &name).await?;
-            }
-            "mapping" => {
-                if store.providers.is_empty() {
-                    cliclack::log::warning("No providers yet.").map_err(|e| e.to_string())?;
-                    continue;
-                }
-                let mut sel = select("Provider mapping");
-                for p in &store.providers {
-                    sel = sel.item(p.name.as_str(), p.name.as_str(), p.base_url.as_str());
-                }
-                let provider_name = sel.interact().map_err(|e| e.to_string())?.to_string();
-                let provider = store.get(&provider_name).unwrap();
-                let client_model: String = input("Codex/client model")
-                    .validate(|v: &String| {
-                        if v.trim().is_empty() {
-                            Err("required")
-                        } else {
-                            Ok(())
-                        }
-                    })
+            "codex" => codex_menu(base, root, &mut store, &store_path).await?,
+            "claude" => {
+                clear_tui();
+                select("Claude Code\nIntegration is not configured")
+                    .item("back", "Back", "")
                     .interact()
                     .map_err(|e| e.to_string())?;
-                let default_upstream = provider
-                    .model_mappings
-                    .get(client_model.trim())
-                    .map(String::as_str)
-                    .or(provider.default_upstream_model.as_deref())
-                    .unwrap_or("");
-                let upstream_model: String = input("Upstream model")
-                    .default_input(default_upstream)
-                    .validate(|v: &String| {
-                        if v.trim().is_empty() {
-                            Err("required")
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .interact()
-                    .map_err(|e| e.to_string())?;
-                mapping_set(&provider_name, &client_model, &upstream_model)?;
-                if let Ok((s, _)) = load_or_migrate(root) {
-                    store = s;
-                }
-                refresh_live_provider_if_active(base, &provider_name).await?;
-            }
-            "status" => {
-                cliclack::log::info(format!(
-                    "store={} active={}",
-                    store_path.display(),
-                    store.active_provider
-                ))
-                .map_err(|e| e.to_string())?;
-                let _ = status(base).await;
             }
             "quit" => break,
             _ => {}
         }
+        if let Ok((fresh, _)) = load_or_migrate(root) {
+            store = fresh;
+        }
     }
 
-    outro("Done.").map_err(|e| e.to_string())?;
+    clear_tui();
     Ok(())
+}
+
+async fn codex_menu(
+    base: &str,
+    root: &PathBuf,
+    store: &mut LlpxStore,
+    store_path: &Path,
+) -> Result<(), String> {
+    loop {
+        clear_tui();
+        let status = if store.codex_active {
+            "ACTIVE"
+        } else {
+            "INACTIVE"
+        };
+        let action = select(format!(
+            "Codex\nConfiguration: {status} · Provider: {}",
+            store.active_provider
+        ))
+        .item(
+            "activation",
+            format!("Configuration · {status}"),
+            "toggle Codex file synchronization",
+        )
+        .item(
+            "providers",
+            "Providers",
+            format!("{} configured", store.providers.len()),
+        )
+        .item(
+            "add_provider",
+            "Add Provider",
+            "create a provider with identity mapping",
+        )
+        .item("mapping", "Model Mapping", "view and edit all mappings")
+        .item("start", "Start proxy", "")
+        .item("stop", "Stop proxy", "")
+        .item("back", "Back", "")
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+        match action {
+            "activation" => {
+                set_codex_active(root, store, store_path, !store.codex_active)?;
+            }
+            "providers" => providers_menu(base, root, store, store_path).await?,
+            "add_provider" => {
+                let provider = prompt_provider(None)?;
+                store.upsert_provider(provider);
+                store.save(store_path).map_err(|e| e.to_string())?;
+            }
+            "mapping" => mappings_menu(base, root, store).await?,
+            "start" => start_proxy(root, true)?,
+            "stop" => stop_proxy(root, true)?,
+            "back" => return Ok(()),
+            _ => {}
+        }
+        if let Ok((fresh, _)) = load_or_migrate(root) {
+            *store = fresh;
+        }
+    }
+}
+
+async fn providers_menu(
+    base: &str,
+    root: &PathBuf,
+    store: &mut LlpxStore,
+    store_path: &Path,
+) -> Result<(), String> {
+    loop {
+        clear_tui();
+        let mut menu = select(format!(
+            "Codex / Providers\nActive provider: {}",
+            store.active_provider
+        ));
+        for provider in &store.providers {
+            let marker = if provider.name == store.active_provider {
+                "●"
+            } else {
+                " "
+            };
+            menu = menu.item(
+                format!("provider:{}", provider.name),
+                format!("{marker} {}", provider.name),
+                format!("{} · {}", provider.api_format.as_str(), provider.base_url),
+            );
+        }
+        menu = menu
+            .item(
+                "add".to_string(),
+                "Add Provider",
+                "create a provider with identity mapping",
+            )
+            .item(
+                "update".to_string(),
+                "Update Provider",
+                "edit an existing provider",
+            )
+            .item(
+                "sync".to_string(),
+                "Sync models",
+                "seed missing 1:1 mappings",
+            )
+            .item("back".to_string(), "Back", "");
+        let action = menu.interact().map_err(|e| e.to_string())?;
+
+        if let Some(name) = action.strip_prefix("provider:") {
+            store.set_active(name).map_err(|e| e.to_string())?;
+            store.save(store_path).map_err(|e| e.to_string())?;
+            use_provider(base, name, true).await?;
+        } else {
+            match action.as_str() {
+                "add" => {
+                    let provider = prompt_provider(None)?;
+                    store.upsert_provider(provider);
+                    store.save(store_path).map_err(|e| e.to_string())?;
+                }
+                "update" => {
+                    if let Some(name) = choose_provider(store, "Update Provider")? {
+                        let existing = store.get(&name).cloned().unwrap();
+                        let provider = prompt_provider(Some(&existing))?;
+                        let updated_name = provider.name.clone();
+                        store
+                            .rename_provider(&name, provider)
+                            .map_err(|e| e.to_string())?;
+                        store.save(store_path).map_err(|e| e.to_string())?;
+                        if store.active_provider == updated_name {
+                            use_provider(base, &updated_name, true).await?;
+                        }
+                    }
+                }
+                "sync" => {
+                    if let Some(name) = choose_provider(store, "Sync models")? {
+                        models_sync(&name, true).await?;
+                        if let Ok((fresh, _)) = load_or_migrate(root) {
+                            *store = fresh;
+                        }
+                        refresh_live_provider_if_active(base, &name, true).await?;
+                    }
+                }
+                "back" => return Ok(()),
+                _ => {}
+            }
+        }
+        if let Ok((fresh, _)) = load_or_migrate(root) {
+            *store = fresh;
+        }
+    }
+}
+
+async fn mappings_menu(base: &str, root: &PathBuf, store: &mut LlpxStore) -> Result<(), String> {
+    loop {
+        clear_tui();
+        let Some(provider_name) = choose_provider(store, "Codex / Model Mapping")? else {
+            return Ok(());
+        };
+        loop {
+            clear_tui();
+            let Some(provider) = store.get(&provider_name) else {
+                break;
+            };
+            let entries: Vec<(String, String)> = provider
+                .model_mappings
+                .iter()
+                .map(|(client, upstream)| (client.clone(), upstream.clone()))
+                .collect();
+            let mut menu = select(format!(
+                "Model Mapping / {provider_name}\n{} mapping(s)",
+                entries.len()
+            ));
+            for (index, (client, upstream)) in entries.iter().enumerate() {
+                menu = menu.item(
+                    index,
+                    format!("{client} → {upstream}"),
+                    "edit upstream model",
+                );
+            }
+            let add_index = entries.len();
+            let back_index = add_index + 1;
+            menu = menu
+                .item(
+                    add_index,
+                    "Add mapping",
+                    "default upstream is the same model",
+                )
+                .item(back_index, "Back", "");
+            let action = menu.interact().map_err(|e| e.to_string())?;
+            if action == back_index {
+                break;
+            }
+
+            let (client_model, default_upstream) = if action == add_index {
+                let client: String = input("Codex/client model")
+                    .validate(|value: &String| {
+                        if value.trim().is_empty() {
+                            Err("required")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .interact()
+                    .map_err(|e| e.to_string())?;
+                let default = client.trim().to_string();
+                (client, default)
+            } else if let Some((client, upstream)) = entries.get(action) {
+                (client.clone(), upstream.clone())
+            } else {
+                continue;
+            };
+            let upstream_model: String = input("Upstream model")
+                .default_input(&default_upstream)
+                .validate(|value: &String| {
+                    if value.trim().is_empty() {
+                        Err("required")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .interact()
+                .map_err(|e| e.to_string())?;
+            mapping_set(&provider_name, &client_model, &upstream_model, true)?;
+            if let Ok((fresh, _)) = load_or_migrate(root) {
+                *store = fresh;
+            }
+            refresh_live_provider_if_active(base, &provider_name, true).await?;
+        }
+    }
+}
+
+fn choose_provider(store: &LlpxStore, prompt: &str) -> Result<Option<String>, String> {
+    if store.providers.is_empty() {
+        return Ok(None);
+    }
+    let mut menu = select(prompt);
+    for provider in &store.providers {
+        menu = menu.item(
+            provider.name.clone(),
+            provider.name.as_str(),
+            format!("{} · {}", provider.api_format.as_str(), provider.base_url),
+        );
+    }
+    menu = menu.item("__back__".to_string(), "Back", "");
+    let selected = menu.interact().map_err(|e| e.to_string())?;
+    if selected == "__back__" {
+        Ok(None)
+    } else {
+        Ok(Some(selected))
+    }
+}
+
+fn set_codex_active(
+    root: &Path,
+    store: &mut LlpxStore,
+    store_path: &Path,
+    active: bool,
+) -> Result<(), String> {
+    let run_dir = root.join(".run");
+    let backup_path = env::var_os("LLPX_CODEX_BACKUP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| codex_live::default_backup_path(&run_dir));
+    if active {
+        if env::var("LLPX_SKIP_CODEX_LIVE").as_deref() != Ok("1") {
+            let bind_addr = env::var("BIND_ADDR")
+                .ok()
+                .or(store.bind_addr.clone())
+                .unwrap_or_else(|| "127.0.0.1:8787".into());
+            codex_live::apply_takeover(&format!("http://{bind_addr}/v1"), &backup_path)
+                .map_err(|e| format!("apply Codex live config failed: {e}"))?;
+        }
+    } else {
+        codex_live::restore_takeover(&backup_path)
+            .map_err(|e| format!("restore Codex live config failed: {e}"))?;
+    }
+    store.codex_active = active;
+    store.save(store_path).map_err(|e| e.to_string())
+}
+
+fn clear_tui() {
+    let _ = cliclack::clear_screen();
 }
 
 fn prompt_provider(existing: Option<&StoredProvider>) -> Result<StoredProvider, String> {

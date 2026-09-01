@@ -18,12 +18,18 @@ pub struct LlpxStore {
     pub bind_addr: Option<String>,
     #[serde(default)]
     pub exchange_log_dir: Option<String>,
+    #[serde(default = "default_codex_active")]
+    pub codex_active: bool,
     pub active_provider: String,
     pub providers: Vec<StoredProvider>,
 }
 
 fn default_version() -> u32 {
     STORE_VERSION
+}
+
+fn default_codex_active() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,6 +55,7 @@ impl LlpxStore {
             version: STORE_VERSION,
             bind_addr: Some("127.0.0.1:8787".into()),
             exchange_log_dir: Some(".run/exchanges".into()),
+            codex_active: true,
             active_provider: active.into(),
             providers: Vec::new(),
         }
@@ -78,6 +85,7 @@ impl LlpxStore {
             version: STORE_VERSION,
             bind_addr: cfg.bind_addr.clone(),
             exchange_log_dir: cfg.exchange_log_dir.clone(),
+            codex_active: true,
             active_provider: cfg.active_provider.clone(),
             providers: cfg
                 .providers
@@ -279,8 +287,20 @@ mod tests {
         store.save(&path).unwrap();
         let loaded = LlpxStore::load(&path).unwrap();
         assert_eq!(loaded.active_provider, "a");
+        assert!(loaded.codex_active);
         assert_eq!(loaded.providers[0].model_mappings["m1"], "m1");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_store_defaults_codex_active() {
+        let value = r#"{
+            "version": 1,
+            "active_provider": "a",
+            "providers": []
+        }"#;
+        let store: LlpxStore = serde_json::from_str(value).unwrap();
+        assert!(store.codex_active);
     }
 
     #[test]
