@@ -39,10 +39,7 @@ pub struct StoredProvider {
     pub api_key: String,
     #[serde(default)]
     pub api_format: ApiFormat,
-    /// Fallback upstream model when the request model has no mapping entry.
-    #[serde(default)]
-    pub default_upstream_model: Option<String>,
-    /// client/Codex model id → upstream model id (default identity).
+    /// client/Codex model id → upstream model id.
     #[serde(default)]
     pub model_mappings: BTreeMap<String, String>,
     #[serde(default)]
@@ -95,7 +92,6 @@ impl LlpxStore {
                     base_url: p.base_url.clone(),
                     api_key: p.api_key.clone(),
                     api_format: p.api_format.clone(),
-                    default_upstream_model: p.upstream_model.clone(),
                     model_mappings: identity_mapping(p.upstream_model.as_deref()),
                     max_output_tokens: p.max_output_tokens,
                 })
@@ -198,7 +194,6 @@ impl From<StoredProvider> for Provider {
             base_url: p.base_url.trim_end_matches('/').to_string(),
             api_key: p.api_key,
             api_format: p.api_format,
-            upstream_model: p.default_upstream_model,
             max_output_tokens: p.max_output_tokens,
             model_mappings: p.model_mappings.into_iter().collect(),
         }
@@ -212,9 +207,6 @@ impl StoredProvider {
             self.model_mappings
                 .entry(id.clone())
                 .or_insert_with(|| id.clone());
-        }
-        if self.default_upstream_model.is_none() {
-            self.default_upstream_model = model_ids.first().cloned();
         }
     }
 }
@@ -280,7 +272,6 @@ mod tests {
             base_url: "https://example.com/v1".into(),
             api_key: "k".into(),
             api_format: ApiFormat::OpenaiResponses,
-            default_upstream_model: Some("m1".into()),
             model_mappings: BTreeMap::from([("m1".into(), "m1".into())]),
             max_output_tokens: None,
         });
@@ -290,6 +281,25 @@ mod tests {
         assert!(loaded.codex_active);
         assert_eq!(loaded.providers[0].model_mappings["m1"], "m1");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_store_ignores_default_upstream_model() {
+        let value = r#"{
+            "version": 1,
+            "active_provider": "a",
+            "providers": [{
+                "name": "a",
+                "base_url": "https://example.com/v1",
+                "api_key": "k",
+                "default_upstream_model": "old-default",
+                "model_mappings": { "client": "upstream" }
+            }]
+        }"#;
+        let store: LlpxStore = serde_json::from_str(value).unwrap();
+        assert_eq!(store.providers[0].model_mappings["client"], "upstream");
+        let json = serde_json::to_value(&store.providers[0]).unwrap();
+        assert!(json.get("default_upstream_model").is_none());
     }
 
     #[test]
@@ -310,7 +320,6 @@ mod tests {
             base_url: "https://x".into(),
             api_key: "k".into(),
             api_format: ApiFormat::OpenaiChat,
-            default_upstream_model: None,
             model_mappings: BTreeMap::from([("client".into(), "upstream".into())]),
             max_output_tokens: None,
         };
@@ -318,7 +327,6 @@ mod tests {
         assert_eq!(p.model_mappings["client"], "upstream");
         assert_eq!(p.model_mappings["a"], "a");
         assert_eq!(p.model_mappings["b"], "b");
-        assert_eq!(p.default_upstream_model.as_deref(), Some("a"));
     }
 
     #[test]
@@ -329,7 +337,6 @@ mod tests {
             base_url: "https://example.com/v1".into(),
             api_key: "key".into(),
             api_format: ApiFormat::OpenaiResponses,
-            default_upstream_model: Some("model".into()),
             model_mappings: BTreeMap::from([(String::from("model"), String::from("model"))]),
             max_output_tokens: None,
         };

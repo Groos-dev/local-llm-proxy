@@ -66,7 +66,7 @@ pub struct ProviderConfig {
     pub api_key: String,
     #[serde(default)]
     pub api_format: ApiFormat,
-    /// Upstream model id. When set, request bodies get `model` rewritten to this.
+    /// Optional identity mapping seed when migrating from TOML.
     #[serde(default)]
     pub upstream_model: Option<String>,
     /// Optional output ceiling injected as Responses `max_output_tokens` before
@@ -81,7 +81,6 @@ pub struct Provider {
     pub base_url: String,
     pub api_key: String,
     pub api_format: ApiFormat,
-    pub upstream_model: Option<String>,
     pub max_output_tokens: Option<u64>,
     /// Codex/client model id → upstream model id.
     pub model_mappings: std::collections::HashMap<String, String>,
@@ -110,27 +109,19 @@ impl Provider {
                 self.name
             )));
         }
-        if self
-            .upstream_model
-            .as_deref()
-            .is_some_and(|model| model.trim().is_empty())
-        {
-            return Err(ConfigError::new(format!(
-                "provider '{}' upstream_model must not be empty",
-                self.name
-            )));
-        }
         Ok(())
     }
 
     /// Resolve the upstream model for an inbound Codex/client model id.
+    /// Unmapped ids pass through; there is no provider-level default.
     pub fn resolve_upstream_model(&self, request_model: Option<&str>) -> Option<String> {
-        if let Some(req) = request_model {
-            if let Some(mapped) = self.model_mappings.get(req) {
-                return Some(mapped.clone());
-            }
-        }
-        self.upstream_model.clone()
+        let req = request_model?;
+        Some(
+            self.model_mappings
+                .get(req)
+                .cloned()
+                .unwrap_or_else(|| req.to_string()),
+        )
     }
 }
 
@@ -203,7 +194,6 @@ impl From<ProviderConfig> for Provider {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key,
             api_format: cfg.api_format,
-            upstream_model: cfg.upstream_model,
             max_output_tokens: cfg.max_output_tokens,
             model_mappings,
         }
@@ -249,9 +239,33 @@ upstream_model = "claude-sonnet"
         assert_eq!(providers[0].name, "a");
         assert!(matches!(providers[0].api_format, ApiFormat::Anthropic));
         assert_eq!(
-            providers[0].upstream_model.as_deref(),
+            providers[0]
+                .model_mappings
+                .get("claude-sonnet")
+                .map(String::as_str),
             Some("claude-sonnet")
         );
+    }
+
+    #[test]
+    fn resolve_maps_or_passes_through_without_default() {
+        let provider = Provider {
+            name: "a".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: "k".into(),
+            api_format: ApiFormat::OpenaiResponses,
+            max_output_tokens: None,
+            model_mappings: std::collections::HashMap::from([("client".into(), "upstream".into())]),
+        };
+        assert_eq!(
+            provider.resolve_upstream_model(Some("client")).as_deref(),
+            Some("upstream")
+        );
+        assert_eq!(
+            provider.resolve_upstream_model(Some("other")).as_deref(),
+            Some("other")
+        );
+        assert_eq!(provider.resolve_upstream_model(None), None);
     }
 
     #[test]
