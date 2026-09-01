@@ -1,6 +1,8 @@
 //! llpx — Hierarchical TUI + headless CLI for local-llm-proxy.
 
-use cliclack::{input, select, spinner};
+mod tui_nav;
+
+use cliclack::spinner;
 use local_llm_proxy::{
     ApiFormat, LlpxStore, StoredProvider, codex_live, default_store_path, load_runtime,
     models_fetch::fetch_model_ids,
@@ -15,6 +17,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tui_nav::{Flow, Menu, input_flow};
 
 const USAGE: &str = "\n\
 Usage:\n\
@@ -177,7 +180,6 @@ async fn providers_cmd(base: &str) -> Result<(), String> {
                 "name": p.name,
                 "api_format": p.api_format.as_str(),
                 "base_url": p.base_url,
-                "default_upstream_model": p.default_upstream_model,
                 "mappings": p.model_mappings.len(),
             })).collect::<Vec<_>>(),
         }))
@@ -405,6 +407,14 @@ fn clear_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn proxy_is_running(root: &Path) -> bool {
+    let pid_path = root.join(".run").join("local-llm-proxy.pid");
+    match read_pid(&pid_path) {
+        Ok(Some(pid)) => process_alive(pid),
+        _ => false,
+    }
+}
+
 fn read_pid(path: &Path) -> Result<Option<u32>, String> {
     if !path.exists() {
         return Ok(None);
@@ -505,7 +515,6 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
         base_url,
         api_key,
         api_format,
-        default_upstream_model: default_model,
         model_mappings: mappings,
         max_output_tokens: None,
     });
@@ -605,29 +614,49 @@ async fn run_wizard(base: &str, root: &PathBuf) -> Result<(), String> {
         } else {
             "INACTIVE"
         };
-        let action = select(format!(
-            "LLPX\nSelect a coding client · Codex config {codex_status}"
-        ))
-        .item(
-            "codex",
-            "Codex",
-            format!("{codex_status} · provider {}", store.active_provider),
-        )
-        .item("claude", "Claude Code", "integration not configured")
-        .item("quit", "Quit", "")
-        .interact()
-        .map_err(|e| e.to_string())?;
+        let proxy_running = proxy_is_running(root);
+        let proxy_status = if proxy_running { "ON" } else { "OFF" };
+        let action = match Menu::new("LLPX")
+            .item(
+                "codex",
+                "Codex",
+                format!("{codex_status} · provider {}", store.active_provider),
+            )
+            .item("claude", "Claude Code", "")
+            .item("proxy", format!("Proxy · {proxy_status}"), "")
+            .interact()?
+        {
+            Flow::Value(action) => action,
+            Flow::Back | Flow::Exit => break,
+        };
 
         match action {
-            "codex" => codex_menu(base, root, &mut store, &store_path).await?,
+            "codex" => {
+                if matches!(
+                    codex_menu(base, root, &mut store, &store_path).await?,
+                    Flow::Exit
+                ) {
+                    break;
+                }
+            }
             "claude" => {
                 clear_tui();
-                select("Claude Code\nIntegration is not configured")
-                    .item("back", "Back", "")
-                    .interact()
-                    .map_err(|e| e.to_string())?;
+                if matches!(
+                    Menu::new("Claude Code\nIntegration is not configured")
+                        .item("stay", "Not configured", "")
+                        .interact()?,
+                    Flow::Exit
+                ) {
+                    break;
+                }
             }
-            "quit" => break,
+            "proxy" => {
+                if proxy_running {
+                    stop_proxy(root, true)?;
+                } else {
+                    start_proxy(root, true)?;
+                }
+            }
             _ => {}
         }
         if let Ok((fresh, _)) = load_or_migrate(root) {
@@ -644,7 +673,7 @@ async fn codex_menu(
     root: &PathBuf,
     store: &mut LlpxStore,
     store_path: &Path,
-) -> Result<(), String> {
+) -> Result<Flow<()>, String> {
     loop {
         clear_tui();
         let status = if store.codex_active {
@@ -652,46 +681,35 @@ async fn codex_menu(
         } else {
             "INACTIVE"
         };
-        let action = select(format!(
+        let action = match Menu::new(format!(
             "Codex\nConfiguration: {status} · Provider: {}",
             store.active_provider
         ))
-        .item(
-            "activation",
-            format!("Configuration · {status}"),
-            "toggle Codex file synchronization",
-        )
+        .item("activation", format!("Configuration · {status}"), "")
         .item(
             "providers",
             "Providers",
             format!("{} configured", store.providers.len()),
         )
-        .item(
-            "add_provider",
-            "Add Provider",
-            "create a provider with identity mapping",
-        )
-        .item("mapping", "Model Mapping", "view and edit all mappings")
-        .item("start", "Start proxy", "")
-        .item("stop", "Stop proxy", "")
-        .item("back", "Back", "")
-        .interact()
-        .map_err(|e| e.to_string())?;
+        .interact()?
+        {
+            Flow::Value(action) => action,
+            Flow::Back => return Ok(Flow::Back),
+            Flow::Exit => return Ok(Flow::Exit),
+        };
 
         match action {
             "activation" => {
                 set_codex_active(root, store, store_path, !store.codex_active)?;
             }
-            "providers" => providers_menu(base, root, store, store_path).await?,
-            "add_provider" => {
-                let provider = prompt_provider(None)?;
-                store.upsert_provider(provider);
-                store.save(store_path).map_err(|e| e.to_string())?;
+            "providers" => {
+                if matches!(
+                    providers_menu(base, root, store, store_path).await?,
+                    Flow::Exit
+                ) {
+                    return Ok(Flow::Exit);
+                }
             }
-            "mapping" => mappings_menu(base, root, store).await?,
-            "start" => start_proxy(root, true)?,
-            "stop" => stop_proxy(root, true)?,
-            "back" => return Ok(()),
             _ => {}
         }
         if let Ok((fresh, _)) = load_or_migrate(root) {
@@ -705,10 +723,10 @@ async fn providers_menu(
     root: &PathBuf,
     store: &mut LlpxStore,
     store_path: &Path,
-) -> Result<(), String> {
+) -> Result<Flow<()>, String> {
     loop {
         clear_tui();
-        let mut menu = select(format!(
+        let mut menu = Menu::new(format!(
             "Codex / Providers\nActive provider: {}",
             store.active_provider
         ));
@@ -724,61 +742,28 @@ async fn providers_menu(
                 format!("{} · {}", provider.api_format.as_str(), provider.base_url),
             );
         }
-        menu = menu
-            .item(
-                "add".to_string(),
-                "Add Provider",
-                "create a provider with identity mapping",
-            )
-            .item(
-                "update".to_string(),
-                "Update Provider",
-                "edit an existing provider",
-            )
-            .item(
-                "sync".to_string(),
-                "Sync models",
-                "seed missing 1:1 mappings",
-            )
-            .item("back".to_string(), "Back", "");
-        let action = menu.interact().map_err(|e| e.to_string())?;
+        menu = menu.item("add".to_string(), "Add Provider", "");
+        let action = match menu.interact()? {
+            Flow::Value(action) => action,
+            Flow::Back => return Ok(Flow::Back),
+            Flow::Exit => return Ok(Flow::Exit),
+        };
 
         if let Some(name) = action.strip_prefix("provider:") {
-            store.set_active(name).map_err(|e| e.to_string())?;
-            store.save(store_path).map_err(|e| e.to_string())?;
-            use_provider(base, name, true).await?;
-        } else {
-            match action.as_str() {
-                "add" => {
-                    let provider = prompt_provider(None)?;
+            if matches!(
+                provider_detail_menu(base, root, store, store_path, name).await?,
+                Flow::Exit
+            ) {
+                return Ok(Flow::Exit);
+            }
+        } else if action == "add" {
+            match prompt_provider(None)? {
+                Flow::Value(provider) => {
                     store.upsert_provider(provider);
                     store.save(store_path).map_err(|e| e.to_string())?;
                 }
-                "update" => {
-                    if let Some(name) = choose_provider(store, "Update Provider")? {
-                        let existing = store.get(&name).cloned().unwrap();
-                        let provider = prompt_provider(Some(&existing))?;
-                        let updated_name = provider.name.clone();
-                        store
-                            .rename_provider(&name, provider)
-                            .map_err(|e| e.to_string())?;
-                        store.save(store_path).map_err(|e| e.to_string())?;
-                        if store.active_provider == updated_name {
-                            use_provider(base, &updated_name, true).await?;
-                        }
-                    }
-                }
-                "sync" => {
-                    if let Some(name) = choose_provider(store, "Sync models")? {
-                        models_sync(&name, true).await?;
-                        if let Ok((fresh, _)) = load_or_migrate(root) {
-                            *store = fresh;
-                        }
-                        refresh_live_provider_if_active(base, &name, true).await?;
-                    }
-                }
-                "back" => return Ok(()),
-                _ => {}
+                Flow::Back => {}
+                Flow::Exit => return Ok(Flow::Exit),
             }
         }
         if let Ok((fresh, _)) = load_or_migrate(root) {
@@ -787,103 +772,158 @@ async fn providers_menu(
     }
 }
 
-async fn mappings_menu(base: &str, root: &PathBuf, store: &mut LlpxStore) -> Result<(), String> {
+async fn provider_detail_menu(
+    base: &str,
+    root: &PathBuf,
+    store: &mut LlpxStore,
+    store_path: &Path,
+    name: &str,
+) -> Result<Flow<()>, String> {
+    let mut current = name.to_string();
     loop {
         clear_tui();
-        let Some(provider_name) = choose_provider(store, "Codex / Model Mapping")? else {
-            return Ok(());
+        let Some(provider) = store.get(&current).cloned() else {
+            return Ok(Flow::Back);
         };
-        loop {
-            clear_tui();
-            let Some(provider) = store.get(&provider_name) else {
-                break;
-            };
-            let entries: Vec<(String, String)> = provider
-                .model_mappings
-                .iter()
-                .map(|(client, upstream)| (client.clone(), upstream.clone()))
-                .collect();
-            let mut menu = select(format!(
-                "Model Mapping / {provider_name}\n{} mapping(s)",
-                entries.len()
-            ));
-            for (index, (client, upstream)) in entries.iter().enumerate() {
-                menu = menu.item(
-                    index,
-                    format!("{client} → {upstream}"),
-                    "edit upstream model",
-                );
-            }
-            let add_index = entries.len();
-            let back_index = add_index + 1;
-            menu = menu
-                .item(
-                    add_index,
-                    "Add mapping",
-                    "default upstream is the same model",
-                )
-                .item(back_index, "Back", "");
-            let action = menu.interact().map_err(|e| e.to_string())?;
-            if action == back_index {
-                break;
-            }
+        let active = provider.name == store.active_provider;
+        let action = match Menu::new(format!(
+            "{}\n{} · {}",
+            provider.name,
+            provider.api_format.as_str(),
+            provider.base_url
+        ))
+        .item(
+            "active",
+            format!("Active · {}", if active { "ON" } else { "OFF" }),
+            "",
+        )
+        .item(
+            "mapping",
+            format!("Model Mapping · {}", provider.model_mappings.len()),
+            "",
+        )
+        .item("edit", "Edit", "")
+        .item("sync", "Sync models", "")
+        .interact()?
+        {
+            Flow::Value(action) => action,
+            Flow::Back => return Ok(Flow::Back),
+            Flow::Exit => return Ok(Flow::Exit),
+        };
 
-            let (client_model, default_upstream) = if action == add_index {
-                let client: String = input("Codex/client model")
-                    .validate(|value: &String| {
-                        if value.trim().is_empty() {
-                            Err("required")
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .interact()
-                    .map_err(|e| e.to_string())?;
-                let default = client.trim().to_string();
-                (client, default)
-            } else if let Some((client, upstream)) = entries.get(action) {
-                (client.clone(), upstream.clone())
-            } else {
-                continue;
-            };
-            let upstream_model: String = input("Upstream model")
-                .default_input(&default_upstream)
-                .validate(|value: &String| {
-                    if value.trim().is_empty() {
-                        Err("required")
-                    } else {
-                        Ok(())
-                    }
-                })
-                .interact()
-                .map_err(|e| e.to_string())?;
-            mapping_set(&provider_name, &client_model, &upstream_model, true)?;
-            if let Ok((fresh, _)) = load_or_migrate(root) {
-                *store = fresh;
+        match action {
+            "active" if !active => {
+                store.set_active(&current).map_err(|e| e.to_string())?;
+                store.save(store_path).map_err(|e| e.to_string())?;
+                use_provider(base, &current, true).await?;
             }
-            refresh_live_provider_if_active(base, &provider_name, true).await?;
+            "mapping" => {
+                if matches!(
+                    mappings_menu(base, root, store, &current).await?,
+                    Flow::Exit
+                ) {
+                    return Ok(Flow::Exit);
+                }
+            }
+            "edit" => {
+                let existing = store.get(&current).cloned().unwrap();
+                match prompt_provider(Some(&existing))? {
+                    Flow::Value(provider) => {
+                        let updated_name = provider.name.clone();
+                        store
+                            .rename_provider(&current, provider)
+                            .map_err(|e| e.to_string())?;
+                        store.save(store_path).map_err(|e| e.to_string())?;
+                        if store.active_provider == updated_name {
+                            use_provider(base, &updated_name, true).await?;
+                        }
+                        current = updated_name;
+                    }
+                    Flow::Back => {}
+                    Flow::Exit => return Ok(Flow::Exit),
+                }
+            }
+            "sync" => {
+                models_sync(&current, true).await?;
+                if let Ok((fresh, _)) = load_or_migrate(root) {
+                    *store = fresh;
+                }
+                refresh_live_provider_if_active(base, &current, true).await?;
+            }
+            _ => {}
+        }
+        if let Ok((fresh, _)) = load_or_migrate(root) {
+            *store = fresh;
         }
     }
 }
 
-fn choose_provider(store: &LlpxStore, prompt: &str) -> Result<Option<String>, String> {
-    if store.providers.is_empty() {
-        return Ok(None);
-    }
-    let mut menu = select(prompt);
-    for provider in &store.providers {
-        menu = menu.item(
-            provider.name.clone(),
-            provider.name.as_str(),
-            format!("{} · {}", provider.api_format.as_str(), provider.base_url),
-        );
-    }
-    menu = menu.item("__back__".to_string(), "Back", "");
-    let selected = menu.interact().map_err(|e| e.to_string())?;
-    if selected == "__back__" {
-        Ok(None)
-    } else {
-        Ok(Some(selected))
+async fn mappings_menu(
+    base: &str,
+    root: &PathBuf,
+    store: &mut LlpxStore,
+    provider_name: &str,
+) -> Result<Flow<()>, String> {
+    loop {
+        clear_tui();
+        let Some(provider) = store.get(provider_name) else {
+            return Ok(Flow::Back);
+        };
+        let entries: Vec<(String, String)> = provider
+            .model_mappings
+            .iter()
+            .map(|(client, upstream)| (client.clone(), upstream.clone()))
+            .collect();
+        let mut menu = Menu::new(format!(
+            "Model Mapping / {provider_name}\n{} mapping(s)",
+            entries.len()
+        ));
+        for (index, (client, upstream)) in entries.iter().enumerate() {
+            menu = menu.item(index, format!("{client} → {upstream}"), "");
+        }
+        let add_index = entries.len();
+        menu = menu.item(add_index, "Add mapping", "");
+        let action = match menu.interact()? {
+            Flow::Value(action) => action,
+            Flow::Back => return Ok(Flow::Back),
+            Flow::Exit => return Ok(Flow::Exit),
+        };
+
+        let (client_model, default_upstream) = if action == add_index {
+            let client = match input_flow("Codex/client model", "", |value| {
+                if value.trim().is_empty() {
+                    Err("required".into())
+                } else {
+                    Ok(())
+                }
+            })? {
+                Flow::Value(client) => client,
+                Flow::Back => continue,
+                Flow::Exit => return Ok(Flow::Exit),
+            };
+            let default = client.trim().to_string();
+            (client, default)
+        } else if let Some((client, upstream)) = entries.get(action) {
+            (client.clone(), upstream.clone())
+        } else {
+            continue;
+        };
+        let upstream_model = match input_flow("Upstream model", &default_upstream, |value| {
+            if value.trim().is_empty() {
+                Err("required".into())
+            } else {
+                Ok(())
+            }
+        })? {
+            Flow::Value(model) => model,
+            Flow::Back => continue,
+            Flow::Exit => return Ok(Flow::Exit),
+        };
+        mapping_set(provider_name, &client_model, &upstream_model, true)?;
+        if let Ok((fresh, _)) = load_or_migrate(root) {
+            *store = fresh;
+        }
+        refresh_live_provider_if_active(base, provider_name, true).await?;
     }
 }
 
@@ -918,96 +958,77 @@ fn clear_tui() {
     let _ = cliclack::clear_screen();
 }
 
-fn prompt_provider(existing: Option<&StoredProvider>) -> Result<StoredProvider, String> {
+fn prompt_provider(existing: Option<&StoredProvider>) -> Result<Flow<StoredProvider>, String> {
     let default_name = existing.map(|p| p.name.as_str()).unwrap_or("");
-    let name: String = input("Provider name")
-        .default_input(default_name)
-        .validate(|v: &String| {
-            if v.trim().is_empty() {
-                Err("required")
-            } else {
-                Ok(())
-            }
-        })
-        .interact()
-        .map_err(|e| e.to_string())?;
+    let name = match input_flow("Provider name", default_name, |v| {
+        if v.trim().is_empty() {
+            Err("required".into())
+        } else {
+            Ok(())
+        }
+    })? {
+        Flow::Value(name) => name,
+        Flow::Back => return Ok(Flow::Back),
+        Flow::Exit => return Ok(Flow::Exit),
+    };
 
-    let base_url: String = input("Base URL")
-        .default_input(existing.map(|p| p.base_url.as_str()).unwrap_or("https://"))
-        .validate(|v: &String| {
+    let base_url = match input_flow(
+        "Base URL",
+        existing.map(|p| p.base_url.as_str()).unwrap_or("https://"),
+        |v| {
             if !(v.starts_with("http://") || v.starts_with("https://")) {
-                Err("must start with http:// or https://")
+                Err("must start with http:// or https://".into())
             } else {
                 Ok(())
             }
-        })
-        .interact()
-        .map_err(|e| e.to_string())?;
+        },
+    )? {
+        Flow::Value(base_url) => base_url,
+        Flow::Back => return Ok(Flow::Back),
+        Flow::Exit => return Ok(Flow::Exit),
+    };
 
-    let api_key: String = input("API key")
-        .default_input(existing.map(|p| p.api_key.as_str()).unwrap_or(""))
-        .validate(|v: &String| {
+    let api_key = match input_flow(
+        "API key",
+        existing.map(|p| p.api_key.as_str()).unwrap_or(""),
+        |v| {
             if v.trim().is_empty() {
-                Err("required")
+                Err("required".into())
             } else {
                 Ok(())
             }
-        })
-        .interact()
-        .map_err(|e| e.to_string())?;
+        },
+    )? {
+        Flow::Value(api_key) => api_key,
+        Flow::Back => return Ok(Flow::Back),
+        Flow::Exit => return Ok(Flow::Exit),
+    };
 
-    let format = select("Upstream protocol")
+    let format = match Menu::new("Upstream protocol")
         .initial_value(match existing.map(|p| &p.api_format) {
             Some(ApiFormat::OpenaiChat) => "chat",
             Some(ApiFormat::Anthropic) => "anthropic",
             _ => "responses",
         })
-        .item(
-            "responses",
-            "OpenAI Responses (passthrough, default)",
-            "no conversion",
-        )
-        .item("chat", "OpenAI Chat Completions", "Responses ⇄ Chat bridge")
-        .item(
-            "anthropic",
-            "Anthropic Messages",
-            "Responses ⇄ Anthropic bridge",
-        )
-        .interact()
-        .map_err(|e| e.to_string())?;
+        .item("responses", "OpenAI Responses (passthrough, default)", "")
+        .item("chat", "OpenAI Chat Completions", "")
+        .item("anthropic", "Anthropic Messages", "")
+        .interact()?
+    {
+        Flow::Value(format) => format,
+        Flow::Back => return Ok(Flow::Back),
+        Flow::Exit => return Ok(Flow::Exit),
+    };
     let api_format = ApiFormat::parse(format).unwrap_or_default();
 
-    let default_model: String = input("Default upstream model (optional)")
-        .default_input(
-            existing
-                .and_then(|p| p.default_upstream_model.as_deref())
-                .unwrap_or(""),
-        )
-        .interact()
-        .map_err(|e| e.to_string())?;
-    let default_upstream_model = {
-        let t = default_model.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        }
-    };
-
-    let mut model_mappings = existing
-        .map(|p| p.model_mappings.clone())
-        .unwrap_or_default();
-    if let Some(m) = default_upstream_model.as_ref() {
-        model_mappings.entry(m.clone()).or_insert_with(|| m.clone());
-    }
-
-    Ok(StoredProvider {
+    Ok(Flow::Value(StoredProvider {
         name: name.trim().to_string(),
         base_url: base_url.trim().trim_end_matches('/').to_string(),
         api_key: api_key.trim().to_string(),
         api_format,
-        default_upstream_model,
-        model_mappings,
+        model_mappings: existing
+            .map(|p| p.model_mappings.clone())
+            .unwrap_or_default(),
         max_output_tokens: existing.and_then(|p| p.max_output_tokens),
-    })
+    }))
 }
