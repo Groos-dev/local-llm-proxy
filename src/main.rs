@@ -716,18 +716,21 @@ fn join_url(base: &str, path: &str) -> String {
     } else {
         format!("/{path}")
     };
-    // Avoid /v1/v1 when base already ends with /v1 and path starts with /v1
-    if base.ends_with("/v1") && path.starts_with("/v1/") {
-        return format!("{}{}", base.trim_end_matches("/v1"), path);
-    }
     // Match cc-switch: an origin-only base URL uses the provider's /v1 API prefix.
     let origin_only = reqwest::Url::parse(base)
         .ok()
         .is_some_and(|url| matches!(url.path(), "" | "/"));
-    if origin_only && path != "/v1" && !path.starts_with("/v1/") {
-        return format!("{base}/v1{path}");
+    let mut url = if base.ends_with("/v1") && path.starts_with("/v1/") {
+        format!("{}{}", base.trim_end_matches("/v1"), path)
+    } else if origin_only && path != "/v1" && !path.starts_with("/v1/") {
+        format!("{base}/v1{path}")
+    } else {
+        format!("{base}{path}")
+    };
+    while url.contains("/v1/v1") {
+        url = url.replace("/v1/v1", "/v1");
     }
-    format!("{base}{path}")
+    url
 }
 
 #[cfg(test)]
@@ -782,6 +785,10 @@ mod tests {
         assert_eq!(
             join_url("https://api.example.com", "/v1/messages"),
             "https://api.example.com/v1/messages"
+        );
+        assert_eq!(
+            join_url("https://api.example.com", "/v1/v1/responses"),
+            "https://api.example.com/v1/responses"
         );
     }
 
