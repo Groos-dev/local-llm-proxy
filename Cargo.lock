@@ -823,6 +823,7 @@ dependencies = [
  "base64",
  "bytes",
  "cliclack",
+ "console",
  "env_logger",
  "futures",
  "futures-util",

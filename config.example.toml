@@ -8,7 +8,6 @@ name = "responses-example"
 base_url = "https://api.openai.com/v1"
 api_key = "replace-me"
 api_format = "openai_responses"
-upstream_model = "gpt-5.4"
 
 # Upstream speaks OpenAI Chat Completions.
 # Compact is bridged to /chat/completions (same as cc-switch).
@@ -17,7 +16,6 @@ name = "chat-example"
 base_url = "https://api.example.com/v1"
 api_key = "replace-me"
 api_format = "openai_chat"
-upstream_model = "gpt-4o"
 
 # Upstream speaks Anthropic Messages.
 # Compact is bridged to /v1/messages (same as cc-switch).
@@ -26,5 +24,4 @@ name = "anthropic-example"
 base_url = "https://api.anthropic.com"
 api_key = "replace-me"
 api_format = "anthropic"
-upstream_model = "claude-sonnet-4-6"
 # max_output_tokens = 16384

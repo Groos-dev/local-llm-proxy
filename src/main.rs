@@ -69,7 +69,6 @@ impl RuntimeProviders {
                 "name": p.name,
                 "api_format": p.api_format.as_str(),
                 "base_url": p.base_url,
-                "upstream_model": p.upstream_model,
                 "model_mappings": p.model_mappings,
             })).collect::<Vec<_>>(),
         })
@@ -174,7 +173,6 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "active_provider": p.name,
         "api_format": p.api_format.as_str(),
         "upstream": p.base_url,
-        "upstream_model": p.upstream_model,
     }))
 }
 
@@ -207,7 +205,6 @@ async fn admin_set_active(
                     "active": p.name,
                     "api_format": p.api_format.as_str(),
                     "upstream": p.base_url,
-                    "upstream_model": p.upstream_model,
                 }),
             )
         }
@@ -230,11 +227,6 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
 
 fn public_model_ids(provider: &Provider) -> Vec<String> {
     let mut ids = provider.model_mappings.keys().cloned().collect::<Vec<_>>();
-    if ids.is_empty()
-        && let Some(model) = provider.upstream_model.as_ref()
-    {
-        ids.push(model.clone());
-    }
     ids.sort();
     ids.dedup();
     ids
@@ -740,13 +732,12 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn models_expose_mapping_keys_and_fallback_model() {
+    fn models_expose_mapping_keys_only() {
         let provider = Provider {
             name: "test".into(),
             base_url: "https://example.com/v1".into(),
             api_key: "key".into(),
             api_format: ApiFormat::OpenaiResponses,
-            upstream_model: Some("fallback".into()),
             max_output_tokens: None,
             model_mappings: HashMap::from([
                 ("zeta".into(), "upstream-z".into()),
@@ -755,9 +746,9 @@ mod tests {
         };
         assert_eq!(public_model_ids(&provider), ["alpha", "zeta"]);
 
-        let mut fallback = provider;
-        fallback.model_mappings.clear();
-        assert_eq!(public_model_ids(&fallback), ["fallback"]);
+        let mut empty = provider;
+        empty.model_mappings.clear();
+        assert!(public_model_ids(&empty).is_empty());
     }
 
     #[test]
@@ -811,7 +802,6 @@ mod tests {
             base_url: "https://example.com/v1".into(),
             api_key: "key".into(),
             api_format: ApiFormat::OpenaiResponses,
-            default_upstream_model: Some(model.into()),
             model_mappings: BTreeMap::from([(model.into(), model.into())]),
             max_output_tokens: None,
         };
