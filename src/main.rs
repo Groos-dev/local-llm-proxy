@@ -720,6 +720,13 @@ fn join_url(base: &str, path: &str) -> String {
     if base.ends_with("/v1") && path.starts_with("/v1/") {
         return format!("{}{}", base.trim_end_matches("/v1"), path);
     }
+    // Match cc-switch: an origin-only base URL uses the provider's /v1 API prefix.
+    let origin_only = reqwest::Url::parse(base)
+        .ok()
+        .is_some_and(|url| matches!(url.path(), "" | "/"));
+    if origin_only && path != "/v1" && !path.starts_with("/v1/") {
+        return format!("{base}/v1{path}");
+    }
     format!("{base}{path}")
 }
 
@@ -748,6 +755,34 @@ mod tests {
         let mut fallback = provider;
         fallback.model_mappings.clear();
         assert_eq!(public_model_ids(&fallback), ["fallback"]);
+    }
+
+    #[test]
+    fn join_url_matches_cc_switch_codex_url_rules() {
+        assert_eq!(
+            join_url("https://api.example.com", "/responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/", "responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1", "/responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1", "/v1/responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/openai", "/responses"),
+            "https://api.example.com/openai/responses"
+        );
+        assert_eq!(
+            join_url("https://api.example.com", "/v1/messages"),
+            "https://api.example.com/v1/messages"
+        );
     }
 
     #[test]
