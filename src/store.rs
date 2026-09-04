@@ -11,7 +11,7 @@ use std::{
 pub const STORE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LlpxStore {
+pub struct AgentProxyStore {
     #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default)]
@@ -46,7 +46,7 @@ pub struct StoredProvider {
     pub max_output_tokens: Option<u64>,
 }
 
-impl LlpxStore {
+impl AgentProxyStore {
     pub fn empty(active: impl Into<String>) -> Self {
         Self {
             version: STORE_VERSION,
@@ -211,14 +211,14 @@ impl StoredProvider {
     }
 }
 
-/// Resolve store path: `LLPX_STORE` → `~/.llpx/store.json`.
+/// Resolve store path: `AGENT_PROXY_STORE` → `~/.agent-proxy/store.json`.
 pub fn default_store_path() -> PathBuf {
-    if let Some(p) = env::var_os("LLPX_STORE") {
+    if let Some(p) = env::var_os("AGENT_PROXY_STORE") {
         return PathBuf::from(p);
     }
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".llpx")
+        .join(".agent-proxy")
         .join("store.json")
 }
 
@@ -232,13 +232,13 @@ fn home_dir() -> Option<PathBuf> {
 pub fn load_runtime(
     store_path: &Path,
     toml_path: Option<&Path>,
-) -> Result<(LlpxStore, PathBuf), ConfigError> {
+) -> Result<(AgentProxyStore, PathBuf), ConfigError> {
     if store_path.exists() {
-        return Ok((LlpxStore::load(store_path)?, store_path.to_path_buf()));
+        return Ok((AgentProxyStore::load(store_path)?, store_path.to_path_buf()));
     }
     if let Some(toml) = toml_path.filter(|p| p.exists()) {
         let cfg = AppConfig::load(toml)?;
-        let store = LlpxStore::from_app_config(&cfg);
+        let store = AgentProxyStore::from_app_config(&cfg);
         store.save(store_path)?;
         return Ok((store, store_path.to_path_buf()));
     }
@@ -258,7 +258,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("llpx-store-{n}"));
+        let dir = env::temp_dir().join(format!("agent-proxy-store-{n}"));
         fs::create_dir_all(&dir).unwrap();
         dir.join("store.json")
     }
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn round_trip_store_json() {
         let path = tmp();
-        let mut store = LlpxStore::empty("a");
+        let mut store = AgentProxyStore::empty("a");
         store.upsert_provider(StoredProvider {
             name: "a".into(),
             base_url: "https://example.com/v1".into(),
@@ -276,7 +276,7 @@ mod tests {
             max_output_tokens: None,
         });
         store.save(&path).unwrap();
-        let loaded = LlpxStore::load(&path).unwrap();
+        let loaded = AgentProxyStore::load(&path).unwrap();
         assert_eq!(loaded.active_provider, "a");
         assert!(loaded.codex_active);
         assert_eq!(loaded.providers[0].model_mappings["m1"], "m1");
@@ -296,7 +296,7 @@ mod tests {
                 "model_mappings": { "client": "upstream" }
             }]
         }"#;
-        let store: LlpxStore = serde_json::from_str(value).unwrap();
+        let store: AgentProxyStore = serde_json::from_str(value).unwrap();
         assert_eq!(store.providers[0].model_mappings["client"], "upstream");
         let json = serde_json::to_value(&store.providers[0]).unwrap();
         assert!(json.get("default_upstream_model").is_none());
@@ -309,7 +309,7 @@ mod tests {
             "active_provider": "a",
             "providers": []
         }"#;
-        let store: LlpxStore = serde_json::from_str(value).unwrap();
+        let store: AgentProxyStore = serde_json::from_str(value).unwrap();
         assert!(store.codex_active);
     }
 
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn rename_provider_rejects_existing_name() {
-        let mut store = LlpxStore::empty("a");
+        let mut store = AgentProxyStore::empty("a");
         let provider = |name: &str| StoredProvider {
             name: name.into(),
             base_url: "https://example.com/v1".into(),
