@@ -23,16 +23,20 @@ pub enum AuthStyle {
 }
 
 pub fn join_url(base: &str, path: &str) -> String {
-    let base = base.trim_end_matches('/');
-    let path = if path.starts_with('/') {
-        path.to_string()
+    let (base_without_query, base_query) = base.split_once('?').unwrap_or((base, ""));
+    let base = base_without_query.trim_end_matches('/');
+    let (path_without_query, endpoint_query) = path.split_once('?').unwrap_or((path, ""));
+    let path = if path_without_query.starts_with('/') {
+        path_without_query.to_string()
     } else {
-        format!("/{path}")
+        format!("/{path_without_query}")
     };
     let origin_only = reqwest::Url::parse(base)
         .ok()
         .is_some_and(|url| matches!(url.path(), "" | "/"));
-    let mut url = if base.ends_with("/v1") && path.starts_with("/v1/") {
+    let mut url = if base.ends_with(&path) {
+        base.to_string()
+    } else if base.ends_with("/v1") && path.starts_with("/v1/") {
         format!("{}{}", base.trim_end_matches("/v1"), path)
     } else if origin_only && path != "/v1" && !path.starts_with("/v1/") {
         format!("{base}/v1{path}")
@@ -41,6 +45,32 @@ pub fn join_url(base: &str, path: &str) -> String {
     };
     while url.contains("/v1/v1") {
         url = url.replace("/v1/v1", "/v1");
+    }
+    if !base_query.is_empty() {
+        url.push('?');
+        url.push_str(base_query);
+    }
+    if !endpoint_query.is_empty() {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str(endpoint_query);
+    }
+    url
+}
+
+pub fn resolve_endpoint_url(base: &str, endpoint: &str, is_full_url: bool) -> String {
+    if !is_full_url {
+        return join_url(base, endpoint);
+    }
+    let (base_without_query, base_query) = base.split_once('?').unwrap_or((base, ""));
+    let (_, endpoint_query) = endpoint.split_once('?').unwrap_or((endpoint, ""));
+    let mut url = base_without_query.trim_end_matches('/').to_string();
+    if !base_query.is_empty() {
+        url.push('?');
+        url.push_str(base_query);
+    }
+    if !endpoint_query.is_empty() {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str(endpoint_query);
     }
     url
 }
@@ -217,6 +247,41 @@ mod tests {
         assert_eq!(
             join_url("https://api.example.com", "/v1/v1/responses"),
             "https://api.example.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn join_url_preserves_query_and_accepts_full_endpoint_bases() {
+        assert_eq!(
+            join_url("https://api.example.com/v1/chat/completions", "/chat/completions"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url(
+                "https://api.example.com/v1/chat/completions",
+                "/chat/completions?model=fast"
+            ),
+            "https://api.example.com/v1/chat/completions?model=fast"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1", "/responses?stream=true"),
+            "https://api.example.com/v1/responses?stream=true"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1/messages?beta=1", "/v1/messages"),
+            "https://api.example.com/v1/messages?beta=1"
+        );
+    }
+
+    #[test]
+    fn explicit_full_endpoint_keeps_base_path_and_adds_query() {
+        assert_eq!(
+            resolve_endpoint_url(
+                "https://relay.example/custom/generate",
+                "/chat/completions?stream=true",
+                true,
+            ),
+            "https://relay.example/custom/generate?stream=true"
         );
     }
 

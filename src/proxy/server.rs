@@ -1,8 +1,9 @@
 //! Proxy server state and router (cc-switch-aligned surface for Codex).
 
 use crate::config::Provider;
-use crate::proxy::handlers::{handle_responses, handle_responses_compact};
+use crate::proxy::handlers::{handle_alpha_search, handle_responses, handle_responses_compact};
 use crate::proxy::http_util::{json_error, json_response};
+use crate::proxy::providers::codex_chat_history::CodexChatHistoryStore;
 use crate::store::AgentProxyStore;
 use axum::{
     Json, Router,
@@ -21,6 +22,7 @@ pub struct ProxyState {
     pub client: reqwest::Client,
     pub runtime: Arc<RwLock<RuntimeProviders>>,
     pub exchange_log_dir: PathBuf,
+    pub codex_chat_history: Arc<CodexChatHistoryStore>,
 }
 
 pub struct RuntimeProviders {
@@ -79,6 +81,10 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/compact", post(handle_responses_compact))
         .route("/v1/v1/responses/compact", post(handle_responses_compact))
         .route("/codex/v1/responses/compact", post(handle_responses_compact))
+        .route("/alpha/search", post(handle_alpha_search))
+        .route("/v1/alpha/search", post(handle_alpha_search))
+        .route("/v1/v1/alpha/search", post(handle_alpha_search))
+        .route("/codex/v1/alpha/search", post(handle_alpha_search))
         .route("/health", get(health))
         .route("/v1/admin/providers", get(admin_providers))
         .route("/v1/admin/active", post(admin_set_active))
@@ -163,9 +169,13 @@ mod tests {
         let provider = Provider {
             name: "test".into(),
             base_url: "https://example.com/v1".into(),
+            is_full_url: false,
             api_key: "key".into(),
             api_format: ApiFormat::OpenaiResponses,
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
             model_mappings: HashMap::from([
                 ("zeta".into(), "upstream-z".into()),
                 ("alpha".into(), "upstream-a".into()),
@@ -196,10 +206,14 @@ mod tests {
         let provider = |name: &str, model: &str| StoredProvider {
             name: name.into(),
             base_url: "https://example.com/v1".into(),
+            is_full_url: false,
             api_key: "key".into(),
             api_format: ApiFormat::OpenaiResponses,
             model_mappings: BTreeMap::from([(model.into(), model.into())]),
             max_output_tokens: None,
+            upstream_model: Some(model.into()),
+            codex_chat_reasoning: None,
+            model_catalog: None,
         };
         let original = AgentProxyStore {
             version: 1,

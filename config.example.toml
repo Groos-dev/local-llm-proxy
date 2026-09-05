@@ -6,6 +6,8 @@ active_provider = "responses-example"
 [[providers]]
 name = "responses-example"
 base_url = "https://api.openai.com/v1"
+# Set true when base_url is already the final upstream endpoint.
+# is_full_url = true
 api_key = "replace-me"
 api_format = "openai_responses"
 

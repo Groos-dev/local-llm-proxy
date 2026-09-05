@@ -458,6 +458,7 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
     let mut api_key = None;
     let mut format = None;
     let mut default_model = None;
+    let mut is_full_url = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -484,6 +485,10 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
                         .ok_or("missing --default-model value")?,
                 );
                 i += 2;
+            }
+            "--full-url" => {
+                is_full_url = true;
+                i += 1;
             }
             other => return Err(format!("unknown flag: {other}")),
         }
@@ -513,10 +518,14 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
     store.upsert_provider(StoredProvider {
         name: name.clone(),
         base_url,
+        is_full_url,
         api_key,
         api_format,
         model_mappings: mappings,
         max_output_tokens: None,
+        upstream_model: default_model.clone(),
+        codex_chat_reasoning: None,
+        model_catalog: None,
     });
     store.set_active(&name).map_err(|e| e.to_string())?;
     store.save(&path).map_err(|e| e.to_string())?;
@@ -1024,11 +1033,15 @@ fn prompt_provider(existing: Option<&StoredProvider>) -> Result<Flow<StoredProvi
     Ok(Flow::Value(StoredProvider {
         name: name.trim().to_string(),
         base_url: base_url.trim().trim_end_matches('/').to_string(),
+        is_full_url: existing.is_some_and(|p| p.is_full_url),
         api_key: api_key.trim().to_string(),
         api_format,
         model_mappings: existing
             .map(|p| p.model_mappings.clone())
             .unwrap_or_default(),
         max_output_tokens: existing.and_then(|p| p.max_output_tokens),
+        upstream_model: existing.and_then(|p| p.upstream_model.clone()),
+        codex_chat_reasoning: existing.and_then(|p| p.codex_chat_reasoning.clone()),
+        model_catalog: existing.and_then(|p| p.model_catalog.clone()),
     }))
 }

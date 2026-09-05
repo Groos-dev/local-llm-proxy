@@ -6,6 +6,7 @@
 
 use agent_proxy::{
     default_store_path, load_runtime,
+    proxy::providers::codex_chat_history::CodexChatHistoryStore,
     proxy::server::{ProxyState, RuntimeProviders, build_router},
 };
 use std::{env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -60,6 +61,7 @@ async fn main() {
         client: reqwest::Client::new(),
         runtime: Arc::new(RwLock::new(runtime)),
         exchange_log_dir,
+        codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
     };
 
     eprintln!(

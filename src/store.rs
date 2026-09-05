@@ -1,7 +1,9 @@
 //! Persistent JSON store for providers, active selection, and model mappings.
 
 use crate::config::{ApiFormat, AppConfig, ConfigError, Provider};
+use crate::provider::CodexChatReasoningConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -36,6 +38,8 @@ fn default_codex_active() -> bool {
 pub struct StoredProvider {
     pub name: String,
     pub base_url: String,
+    #[serde(default)]
+    pub is_full_url: bool,
     pub api_key: String,
     #[serde(default)]
     pub api_format: ApiFormat,
@@ -44,6 +48,13 @@ pub struct StoredProvider {
     pub model_mappings: BTreeMap<String, String>,
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// Default upstream model used when request body omits `model` (cc-switch `settings_config.model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<Value>,
 }
 
 impl AgentProxyStore {
@@ -90,10 +101,14 @@ impl AgentProxyStore {
                 .map(|p| StoredProvider {
                     name: p.name.clone(),
                     base_url: p.base_url.clone(),
+                    is_full_url: p.is_full_url,
                     api_key: p.api_key.clone(),
                     api_format: p.api_format.clone(),
                     model_mappings: identity_mapping(p.upstream_model.as_deref()),
                     max_output_tokens: p.max_output_tokens,
+                    upstream_model: p.upstream_model.clone(),
+                    codex_chat_reasoning: p.codex_chat_reasoning.clone(),
+                    model_catalog: p.model_catalog.clone(),
                 })
                 .collect(),
         }
@@ -192,9 +207,13 @@ impl From<StoredProvider> for Provider {
         Self {
             name: p.name,
             base_url: p.base_url.trim_end_matches('/').to_string(),
+            is_full_url: p.is_full_url,
             api_key: p.api_key,
             api_format: p.api_format,
             max_output_tokens: p.max_output_tokens,
+            upstream_model: p.upstream_model,
+            codex_chat_reasoning: p.codex_chat_reasoning,
+            model_catalog: p.model_catalog,
             model_mappings: p.model_mappings.into_iter().collect(),
         }
     }
@@ -270,10 +289,14 @@ mod tests {
         store.upsert_provider(StoredProvider {
             name: "a".into(),
             base_url: "https://example.com/v1".into(),
+            is_full_url: false,
             api_key: "k".into(),
             api_format: ApiFormat::OpenaiResponses,
             model_mappings: BTreeMap::from([("m1".into(), "m1".into())]),
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
         });
         store.save(&path).unwrap();
         let loaded = AgentProxyStore::load(&path).unwrap();
@@ -318,10 +341,14 @@ mod tests {
         let mut p = StoredProvider {
             name: "a".into(),
             base_url: "https://x".into(),
+            is_full_url: false,
             api_key: "k".into(),
             api_format: ApiFormat::OpenaiChat,
             model_mappings: BTreeMap::from([("client".into(), "upstream".into())]),
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
         };
         p.apply_identity_mappings_from_models(&["a".into(), "b".into()]);
         assert_eq!(p.model_mappings["client"], "upstream");
@@ -335,10 +362,14 @@ mod tests {
         let provider = |name: &str| StoredProvider {
             name: name.into(),
             base_url: "https://example.com/v1".into(),
+            is_full_url: false,
             api_key: "key".into(),
             api_format: ApiFormat::OpenaiResponses,
             model_mappings: BTreeMap::from([(String::from("model"), String::from("model"))]),
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
         };
         store.upsert_provider(provider("a"));
         store.upsert_provider(provider("b"));

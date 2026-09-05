@@ -1,3 +1,5 @@
+pub(crate) mod content_encoding;
+pub mod cache_injector;
 pub mod error;
 pub mod forwarder;
 pub mod handler_context;

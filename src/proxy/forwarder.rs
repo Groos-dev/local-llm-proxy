@@ -1,12 +1,16 @@
-//! Request forwarder (cc-switch-aligned, Codex-only, no failover).
+//! 请求转发器
 
+use crate::proxy::cache_injector::{self, anthropic_cache_injection_enabled};
 use crate::proxy::handler_context::RequestContext;
 use crate::proxy::http_util::{
-    AuthStyle, join_url, json_error, json_response, relay_error_body, send_json, sse_response,
+    AuthStyle, json_error, json_response, relay_error_body, resolve_endpoint_url,
+    send_json, sse_response,
 };
+use crate::proxy::providers::codex_chat_history::record_responses_sse_stream;
 use crate::proxy::providers::{
-    provider_needs_responses_namespace_flatten, should_convert_codex_responses_to_anthropic,
-    should_convert_codex_responses_to_chat,
+    client_provided_codex_session_id, inject_codex_chat_prompt_cache_key,
+    provider_needs_responses_namespace_flatten, resolve_codex_chat_reasoning_config,
+    should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
     streaming_codex_anthropic::create_responses_sse_stream_from_anthropic_with_context,
     streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
     transform_codex_anthropic::{
@@ -17,6 +21,7 @@ use crate::proxy::providers::{
         responses_to_chat_completions_with_reasoning,
     },
     transform_codex_responses_namespace::{self, NamespacedName},
+    transform_codex_chat_moonshot_schema,
     transform_codex_responses_xai_sanitize,
 };
 use crate::proxy::response_processor::{is_sse_response, process_response};
@@ -47,15 +52,11 @@ impl RequestForwarder {
     pub(crate) async fn forward_with_retry(
         &self,
         ctx: &mut RequestContext,
+        endpoint: &str,
         body: Value,
         tool_context: CodexToolContext,
         namespace_restore_map: HashMap<String, NamespacedName>,
     ) -> ForwardResult {
-        let endpoint = if ctx.compact {
-            "/responses/compact"
-        } else {
-            "/responses"
-        };
         let response = self
             .forward(ctx, endpoint, body, tool_context, namespace_restore_map)
             .await;
@@ -72,9 +73,7 @@ impl RequestForwarder {
     ) -> Response {
         let provider = &ctx.provider;
         if should_convert_codex_responses_to_anthropic(provider, endpoint) {
-            return self
-                .forward_anthropic(ctx, body, tool_context)
-                .await;
+            return self.forward_anthropic(ctx, body, tool_context).await;
         }
         if should_convert_codex_responses_to_chat(provider, endpoint) {
             return self.forward_chat(ctx, body, tool_context).await;
@@ -91,13 +90,6 @@ impl RequestForwarder {
         namespace_restore_map: HashMap<String, NamespacedName>,
     ) -> Response {
         let provider = ctx.provider.clone();
-        let path = if ctx.compact {
-            "/responses/compact"
-        } else if endpoint.contains("compact") {
-            "/responses/compact"
-        } else {
-            "/responses"
-        };
 
         if provider_needs_responses_namespace_flatten(&provider) {
             if let Ok(true) =
@@ -108,8 +100,8 @@ impl RequestForwarder {
                     provider.name
                 );
             }
-            let upstream_model = provider
-                .resolve_upstream_model(body.get("model").and_then(|v| v.as_str()));
+            let upstream_model =
+                provider.resolve_upstream_model(body.get("model").and_then(|v| v.as_str()));
             transform_codex_responses_xai_sanitize::apply_xai_native_responses_request_compat(
                 &mut body,
                 &provider.name,
@@ -118,7 +110,7 @@ impl RequestForwarder {
             );
         }
 
-        let url = join_url(&provider.base_url, path);
+        let url = resolve_endpoint_url(&provider.base_url, endpoint, provider.is_full_url);
         ctx.exchange.write("upstream_request.json", &body);
         let upstream = match send_json(
             &self.state.client,
@@ -151,21 +143,56 @@ impl RequestForwarder {
     async fn forward_chat(
         &self,
         ctx: &mut RequestContext,
-        body: Value,
+        mut body: Value,
         tool_context: CodexToolContext,
     ) -> Response {
         let provider = ctx.provider.clone();
-        let mut chat_body = match responses_to_chat_completions_with_reasoning(body, None) {
-            Ok(v) => v,
-            Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
-        };
+        let explicit_prompt_cache_key = body
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+        let client_session = client_provided_codex_session_id(&ctx.client_headers, &body);
+
+        let restored = self
+            .state
+            .codex_chat_history
+            .enrich_request(&mut body)
+            .await;
+        if restored > 0 {
+            log::debug!(
+                "[Codex] Restored or enriched {restored} cached function call item(s) for Chat upstream"
+            );
+        }
+
+        let reasoning_config = resolve_codex_chat_reasoning_config(&provider, &body);
+        let mut chat_body =
+            match responses_to_chat_completions_with_reasoning(body, reasoning_config.as_ref()) {
+                Ok(v) => v,
+                Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
+            };
         if let Some(upstream_model) =
             provider.resolve_upstream_model(chat_body.get("model").and_then(|v| v.as_str()))
         {
             chat_body["model"] = json!(upstream_model);
         }
+        if transform_codex_chat_moonshot_schema::upstream_requires_ref_sibling_all_of(
+            &provider.base_url,
+        ) {
+            transform_codex_chat_moonshot_schema::wrap_ref_siblings_in_chat_tools(&mut chat_body);
+        }
+        inject_codex_chat_prompt_cache_key(
+            &provider,
+            &mut chat_body,
+            explicit_prompt_cache_key.as_deref(),
+            client_session.as_deref(),
+        );
+
         ctx.exchange.write("upstream_request.json", &chat_body);
-        let url = join_url(&provider.base_url, "/chat/completions");
+        let url = resolve_endpoint_url(
+            &provider.base_url,
+            "/chat/completions",
+            provider.is_full_url,
+        );
         let upstream = match send_json(
             &self.state.client,
             &provider,
@@ -192,6 +219,8 @@ impl RequestForwarder {
             let stream = upstream.bytes_stream();
             let converted =
                 create_responses_sse_stream_from_chat_with_context(stream, tool_context);
+            let converted =
+                record_responses_sse_stream(converted, self.state.codex_chat_history.clone());
             return sse_response(status, &headers, converted, &mut ctx.exchange);
         }
 
@@ -199,8 +228,7 @@ impl RequestForwarder {
             Ok(b) => b,
             Err(err) => return json_error(StatusCode::BAD_GATEWAY, err.to_string()),
         };
-        ctx.exchange
-            .write_raw("upstream_response.json", &bytes);
+        ctx.exchange.write_raw("upstream_response.json", &bytes);
         let chat_json: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(err) => {
@@ -209,6 +237,10 @@ impl RequestForwarder {
         };
         match chat_completion_to_response_with_context(chat_json, &tool_context) {
             Ok(converted) => {
+                self.state
+                    .codex_chat_history
+                    .record_response(&converted)
+                    .await;
                 ctx.exchange.write("codex_response.json", &converted);
                 json_response(status, converted)
             }
@@ -226,25 +258,16 @@ impl RequestForwarder {
         if let Some(max_out) = provider.max_output_tokens.filter(|v| *v > 0) {
             body["max_output_tokens"] = json!(max_out);
         }
-        let anthropic_body =
+        let mut anthropic_body =
             match responses_request_to_anthropic(body, DEFAULT_ANTHROPIC_MAX_TOKENS) {
                 Ok(v) => v,
                 Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
             };
+        cache_injector::inject(&mut anthropic_body, anthropic_cache_injection_enabled());
+
         ctx.exchange
             .write("upstream_request.json", &anthropic_body);
-        let url = join_url(&provider.base_url, "/v1/messages");
-        let url = if provider
-            .base_url
-            .trim_end_matches('/')
-            .ends_with("/v1/messages")
-        {
-            provider.base_url.trim_end_matches('/').to_string()
-        } else if provider.base_url.trim_end_matches('/').ends_with("/v1") {
-            format!("{}/messages", provider.base_url.trim_end_matches('/'))
-        } else {
-            url
-        };
+        let url = resolve_endpoint_url(&provider.base_url, "/v1/messages", provider.is_full_url);
 
         let upstream = match send_json(
             &self.state.client,
@@ -279,8 +302,7 @@ impl RequestForwarder {
             Ok(b) => b,
             Err(err) => return json_error(StatusCode::BAD_GATEWAY, err.to_string()),
         };
-        ctx.exchange
-            .write_raw("upstream_response.json", &bytes);
+        ctx.exchange.write_raw("upstream_response.json", &bytes);
         let anthropic_json: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(err) => {
@@ -323,7 +345,10 @@ async fn handle_xai_native_response(
     let Ok(mut body) = serde_json::from_slice::<Value>(&bytes) else {
         return crate::proxy::http_util::response_with_headers(
             status,
-            crate::proxy::http_util::response_headers_for_body(&HeaderMap::new(), "application/json"),
+            crate::proxy::http_util::response_headers_for_body(
+                &HeaderMap::new(),
+                "application/json",
+            ),
             bytes,
         );
     };
