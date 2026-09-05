@@ -417,7 +417,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("llpx-codex-live-{nanos}"));
+        let dir = std::env::temp_dir().join(format!("agent-proxy-codex-live-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

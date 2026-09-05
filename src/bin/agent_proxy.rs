@@ -1,10 +1,10 @@
-//! llpx — Hierarchical TUI + headless CLI for local-llm-proxy.
+//! agent-proxy — Hierarchical TUI + headless CLI for AgentProxy.
 
 mod tui_nav;
 
 use cliclack::spinner;
-use local_llm_proxy::{
-    ApiFormat, LlpxStore, StoredProvider, codex_live, default_store_path, load_runtime,
+use agent_proxy::{
+    ApiFormat, AgentProxyStore, StoredProvider, codex_live, default_store_path, load_runtime,
     models_fetch::fetch_model_ids,
 };
 use std::{
@@ -21,17 +21,17 @@ use tui_nav::{Flow, Menu, input_flow};
 
 const USAGE: &str = "\n\
 Usage:\n\
-  llpx                      Interactive hierarchical TUI\n\
-  llpx configure            Open the same interactive TUI\n\
-  llpx status               Proxy health\n\
-  llpx providers            List providers (store + live)\n\
-  llpx use <name>           Hot-switch active provider\n\
-  llpx start                Start proxy (Codex takeover when ACTIVE)\n\
-  llpx stop                 Stop proxy + restore Codex\n\
-  llpx provider upsert ...  Non-interactive provider write\n\
-  llpx models sync <name>   Fetch /v1/models + identity mappings\n\
-  llpx mapping set ...      Set a client model -> upstream model mapping\n\
-  llpx --base <url> ...     Override proxy base for live admin calls\n\
+  agent-proxy                      Interactive hierarchical TUI\n\
+  agent-proxy configure            Open the same interactive TUI\n\
+  agent-proxy status               Proxy health\n\
+  agent-proxy providers            List providers (store + live)\n\
+  agent-proxy use <name>           Hot-switch active provider\n\
+  agent-proxy start                Start proxy (Codex takeover when ACTIVE)\n\
+  agent-proxy stop                 Stop proxy + restore Codex\n\
+  agent-proxy provider upsert ...  Non-interactive provider write\n\
+  agent-proxy models sync <name>   Fetch /v1/models + identity mappings\n\
+  agent-proxy mapping set ...      Set a client model -> upstream model mapping\n\
+  agent-proxy --base <url> ...     Override proxy base for live admin calls\n\
 \n\
 provider upsert flags:\n\
   --name <id> --base-url <url> --api-key <key>\n\
@@ -41,9 +41,9 @@ mapping set arguments:\n\
   <provider> <client-model> <upstream-model>\n\
 \n\
 Env:\n\
-  LLPX_STORE   JSON store path (default ~/.llpx/store.json)\n\
+  AGENT_PROXY_STORE   JSON store path (default ~/.agent-proxy/store.json)\n\
   CONFIG_PATH  TOML to migrate from when store is missing\n\
-  LLPX_BASE / PROXY_BASE  live proxy base (default http://127.0.0.1:8787)\n";
+  AGENT_PROXY_BASE / PROXY_BASE  live proxy base (default http://127.0.0.1:8787)\n";
 
 #[tokio::main]
 async fn main() {
@@ -70,7 +70,7 @@ async fn main() {
             Some("upsert") => provider_upsert(&args[2..]),
             _ => {
                 eprint!(
-                    "usage: llpx provider upsert --name .. --base-url .. --api-key .. --format ..\n"
+                    "usage: agent-proxy provider upsert --name .. --base-url .. --api-key .. --format ..\n"
                 );
                 process::exit(1);
             }
@@ -79,7 +79,7 @@ async fn main() {
             Some("sync") => {
                 let name = args.get(2).cloned().unwrap_or_default();
                 if name.is_empty() {
-                    eprint!("usage: llpx models sync <provider-name>\n");
+                    eprint!("usage: agent-proxy models sync <provider-name>\n");
                     process::exit(1);
                 }
                 match models_sync(&name, false).await {
@@ -88,7 +88,7 @@ async fn main() {
                 }
             }
             _ => {
-                eprint!("usage: llpx models sync <provider-name>\n");
+                eprint!("usage: agent-proxy models sync <provider-name>\n");
                 process::exit(1);
             }
         },
@@ -100,7 +100,7 @@ async fn main() {
                 }
             }
             _ => {
-                eprint!("usage: llpx mapping set <provider> <client-model> <upstream-model>\n");
+                eprint!("usage: agent-proxy mapping set <provider> <client-model> <upstream-model>\n");
                 process::exit(1);
             }
         },
@@ -125,7 +125,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn store_and_toml(root: &PathBuf) -> (PathBuf, PathBuf) {
-    let store = env::var_os("LLPX_STORE")
+    let store = env::var_os("AGENT_PROXY_STORE")
         .map(PathBuf::from)
         .unwrap_or_else(default_store_path);
     let toml = env::var_os("CONFIG_PATH")
@@ -134,7 +134,7 @@ fn store_and_toml(root: &PathBuf) -> (PathBuf, PathBuf) {
     (store, toml)
 }
 
-fn load_or_migrate(root: &PathBuf) -> Result<(LlpxStore, PathBuf), String> {
+fn load_or_migrate(root: &PathBuf) -> Result<(AgentProxyStore, PathBuf), String> {
     let (store_path, toml) = store_and_toml(root);
     load_runtime(&store_path, Some(&toml)).map_err(|e| e.to_string())
 }
@@ -149,7 +149,7 @@ fn parse_base(mut args: Vec<String>) -> (String, Vec<String>) {
         args.drain(0..2);
         return (base, args);
     }
-    let base = env::var("LLPX_BASE")
+    let base = env::var("AGENT_PROXY_BASE")
         .or_else(|_| env::var("PROXY_BASE"))
         .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
     (base, args)
@@ -239,7 +239,7 @@ fn start_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
     let (store, store_path) = load_or_migrate(root)?;
     let run_dir = root.join(".run");
     fs::create_dir_all(&run_dir).map_err(|e| format!("create {}: {e}", run_dir.display()))?;
-    let pid_path = run_dir.join("local-llm-proxy.pid");
+    let pid_path = run_dir.join("agent-proxy-server.pid");
     if let Some(pid) = read_pid(&pid_path)? {
         if process_alive(pid) {
             if !quiet {
@@ -265,7 +265,7 @@ fn start_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
     fs::create_dir_all(&exchange_dir)
         .map_err(|e| format!("create {}: {e}", exchange_dir.display()))?;
 
-    let log_path = run_dir.join("local-llm-proxy.log");
+    let log_path = run_dir.join("agent-proxy-server.log");
     let log = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -276,20 +276,20 @@ fn start_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
         .try_clone()
         .map_err(|e| format!("clone {}: {e}", log_path.display()))?;
 
-    let binary = root.join("target/debug/local-llm-proxy");
+    let binary = root.join("target/debug/agent-proxy-server");
     ensure_proxy_binary(root, &binary)?;
 
-    let backup_path = env::var_os("LLPX_CODEX_BACKUP")
+    let backup_path = env::var_os("AGENT_PROXY_CODEX_BACKUP")
         .map(PathBuf::from)
         .unwrap_or_else(|| codex_live::default_backup_path(&run_dir));
-    if store.codex_active && env::var("LLPX_SKIP_CODEX_LIVE").as_deref() != Ok("1") {
+    if store.codex_active && env::var("AGENT_PROXY_SKIP_CODEX_LIVE").as_deref() != Ok("1") {
         codex_live::apply_takeover(&format!("http://{bind_addr}/v1"), &backup_path)
             .map_err(|e| format!("apply Codex live config failed: {e}"))?;
     }
     let child = Command::new("nohup")
         .arg(&binary)
         .current_dir(root)
-        .env("LLPX_STORE", &store_path)
+        .env("AGENT_PROXY_STORE", &store_path)
         .env("EXCHANGE_LOG_DIR", &exchange_dir)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
@@ -320,7 +320,7 @@ fn start_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
 
 fn stop_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
     let run_dir = root.join(".run");
-    let pid_path = run_dir.join("local-llm-proxy.pid");
+    let pid_path = run_dir.join("agent-proxy-server.pid");
     let runtime_store = load_or_migrate(root).ok().map(|(store, _)| store);
     let mut stopped = false;
     if let Some(pid) = read_pid(&pid_path)? {
@@ -361,7 +361,7 @@ fn stop_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
         }
     }
 
-    let backup_path = env::var_os("LLPX_CODEX_BACKUP")
+    let backup_path = env::var_os("AGENT_PROXY_CODEX_BACKUP")
         .map(PathBuf::from)
         .unwrap_or_else(|| codex_live::default_backup_path(&run_dir));
     codex_live::restore_takeover(&backup_path)
@@ -390,13 +390,13 @@ fn stop_proxy(root: &PathBuf, quiet: bool) -> Result<(), String> {
 fn ensure_proxy_binary(root: &Path, binary: &Path) -> Result<(), String> {
     let status = Command::new("cargo")
         .current_dir(root)
-        .args(["build", "-q", "--bin", "local-llm-proxy"])
+        .args(["build", "-q", "--bin", "agent-proxy-server"])
         .status()
-        .map_err(|e| format!("build local-llm-proxy: {e}"))?;
+        .map_err(|e| format!("build agent-proxy-server: {e}"))?;
     if status.success() && binary.exists() {
         Ok(())
     } else {
-        Err(format!("build local-llm-proxy exited {status}"))
+        Err(format!("build agent-proxy-server exited {status}"))
     }
 }
 
@@ -408,7 +408,7 @@ fn clear_dir(path: &Path) -> Result<(), String> {
 }
 
 fn proxy_is_running(root: &Path) -> bool {
-    let pid_path = root.join(".run").join("local-llm-proxy.pid");
+    let pid_path = root.join(".run").join("agent-proxy-server.pid");
     match read_pid(&pid_path) {
         Ok(Some(pid)) => process_alive(pid),
         _ => false,
@@ -458,6 +458,7 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
     let mut api_key = None;
     let mut format = None;
     let mut default_model = None;
+    let mut is_full_url = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -485,6 +486,10 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
                 );
                 i += 2;
             }
+            "--full-url" => {
+                is_full_url = true;
+                i += 1;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -499,10 +504,10 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
     let (mut store, path) = match load_or_migrate(&root) {
         Ok(v) => v,
         Err(_) => {
-            let path = env::var_os("LLPX_STORE")
+            let path = env::var_os("AGENT_PROXY_STORE")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_store_path);
-            (LlpxStore::empty(&name), path)
+            (AgentProxyStore::empty(&name), path)
         }
     };
 
@@ -513,10 +518,14 @@ fn provider_upsert(args: &[String]) -> Result<(), String> {
     store.upsert_provider(StoredProvider {
         name: name.clone(),
         base_url,
+        is_full_url,
         api_key,
         api_format,
         model_mappings: mappings,
         max_output_tokens: None,
+        upstream_model: default_model.clone(),
+        codex_chat_reasoning: None,
+        model_catalog: None,
     });
     store.set_active(&name).map_err(|e| e.to_string())?;
     store.save(&path).map_err(|e| e.to_string())?;
@@ -600,10 +609,10 @@ async fn run_wizard(base: &str, root: &PathBuf) -> Result<(), String> {
     let (mut store, store_path) = match load_or_migrate(root) {
         Ok(v) => v,
         Err(_) => {
-            let path = env::var_os("LLPX_STORE")
+            let path = env::var_os("AGENT_PROXY_STORE")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_store_path);
-            (LlpxStore::empty("default"), path)
+            (AgentProxyStore::empty("default"), path)
         }
     };
 
@@ -671,7 +680,7 @@ async fn run_wizard(base: &str, root: &PathBuf) -> Result<(), String> {
 async fn codex_menu(
     base: &str,
     root: &PathBuf,
-    store: &mut LlpxStore,
+    store: &mut AgentProxyStore,
     store_path: &Path,
 ) -> Result<Flow<()>, String> {
     loop {
@@ -721,7 +730,7 @@ async fn codex_menu(
 async fn providers_menu(
     base: &str,
     root: &PathBuf,
-    store: &mut LlpxStore,
+    store: &mut AgentProxyStore,
     store_path: &Path,
 ) -> Result<Flow<()>, String> {
     loop {
@@ -775,7 +784,7 @@ async fn providers_menu(
 async fn provider_detail_menu(
     base: &str,
     root: &PathBuf,
-    store: &mut LlpxStore,
+    store: &mut AgentProxyStore,
     store_path: &Path,
     name: &str,
 ) -> Result<Flow<()>, String> {
@@ -861,7 +870,7 @@ async fn provider_detail_menu(
 async fn mappings_menu(
     base: &str,
     root: &PathBuf,
-    store: &mut LlpxStore,
+    store: &mut AgentProxyStore,
     provider_name: &str,
 ) -> Result<Flow<()>, String> {
     loop {
@@ -929,16 +938,16 @@ async fn mappings_menu(
 
 fn set_codex_active(
     root: &Path,
-    store: &mut LlpxStore,
+    store: &mut AgentProxyStore,
     store_path: &Path,
     active: bool,
 ) -> Result<(), String> {
     let run_dir = root.join(".run");
-    let backup_path = env::var_os("LLPX_CODEX_BACKUP")
+    let backup_path = env::var_os("AGENT_PROXY_CODEX_BACKUP")
         .map(PathBuf::from)
         .unwrap_or_else(|| codex_live::default_backup_path(&run_dir));
     if active {
-        if env::var("LLPX_SKIP_CODEX_LIVE").as_deref() != Ok("1") {
+        if env::var("AGENT_PROXY_SKIP_CODEX_LIVE").as_deref() != Ok("1") {
             let bind_addr = env::var("BIND_ADDR")
                 .ok()
                 .or(store.bind_addr.clone())
@@ -1024,11 +1033,15 @@ fn prompt_provider(existing: Option<&StoredProvider>) -> Result<Flow<StoredProvi
     Ok(Flow::Value(StoredProvider {
         name: name.trim().to_string(),
         base_url: base_url.trim().trim_end_matches('/').to_string(),
+        is_full_url: existing.is_some_and(|p| p.is_full_url),
         api_key: api_key.trim().to_string(),
         api_format,
         model_mappings: existing
             .map(|p| p.model_mappings.clone())
             .unwrap_or_default(),
         max_output_tokens: existing.and_then(|p| p.max_output_tokens),
+        upstream_model: existing.and_then(|p| p.upstream_model.clone()),
+        codex_chat_reasoning: existing.and_then(|p| p.codex_chat_reasoning.clone()),
+        model_catalog: existing.and_then(|p| p.model_catalog.clone()),
     }))
 }

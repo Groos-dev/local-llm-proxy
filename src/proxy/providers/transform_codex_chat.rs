@@ -17,12 +17,12 @@ use crate::proxy::{
         short_sha256_hex,
     },
     tool_media::{
-        TOOL_RESULT_MEDIA_MOVED_MARKER, ToolMediaScope, chat_file_from_input_file,
-        flush_pending_chat_tool_media, plan_chat_tool_output_media, queue_chat_tool_output_media,
-        strip_and_clamp_media_from_tool_value,
+        chat_file_from_input_file, flush_pending_chat_tool_media, plan_chat_tool_output_media,
+        queue_chat_tool_output_media, strip_and_clamp_media_from_tool_value, ToolMediaScope,
+        TOOL_RESULT_MEDIA_MOVED_MARKER,
     },
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -1032,9 +1032,9 @@ fn backfill_tool_call_reasoning_placeholders(messages: &mut [Value]) {
         let is_assistant_tool_call = message.get("role").and_then(|value| value.as_str())
             == Some("assistant")
             && message
-                .get("tool_calls")
-                .and_then(|value| value.as_array())
-                .is_some_and(|calls| !calls.is_empty());
+            .get("tool_calls")
+            .and_then(|value| value.as_array())
+            .is_some_and(|calls| !calls.is_empty());
         if is_assistant_tool_call {
             ensure_tool_call_reasoning_content(message);
         }
@@ -2028,7 +2028,7 @@ pub fn chat_error_to_response_error(body: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     fn large_test_image_data_url() -> String {
         let bytes = b"CC_SWITCH_TOOL_MEDIA_SENTINEL".repeat(400);
@@ -2066,7 +2066,7 @@ mod tests {
             "model": "kimi-k3",
             "input": items
         }))
-        .unwrap()
+            .unwrap()
     }
 
     fn result_messages(result: &Value) -> &[Value] {
@@ -2505,12 +2505,10 @@ mod tests {
         );
         assert_eq!(result["messages"][1]["role"], "tool");
         assert_eq!(result["messages"][1]["tool_call_id"], "call_tool_search_1");
-        assert!(
-            result["messages"][1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("mcp__codex_apps__gmail")
-        );
+        assert!(result["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mcp__codex_apps__gmail"));
     }
 
     #[test]
@@ -3551,18 +3549,14 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call_2");
         assert!(messages[1]["content"].is_string());
         assert!(messages[2]["content"].is_string());
-        assert!(
-            !messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains(&first_url)
-        );
-        assert!(
-            !messages[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains(second_payload)
-        );
+        assert!(!messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&first_url));
+        assert!(!messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains(second_payload));
         assert_eq!(messages[3]["content"].as_array().unwrap().len(), 4);
         assert_eq!(
             messages[3]["content"][3]["image_url"]["url"],
@@ -3738,7 +3732,7 @@ mod tests {
                 }
             ]
         })
-        .to_string();
+            .to_string();
         let result = convert_test_input(vec![
             test_function_call("call_string"),
             test_function_output("call_string", Value::String(output)),
@@ -3753,12 +3747,10 @@ mod tests {
             tool_content["content"][1]["text"],
             TOOL_RESULT_MEDIA_MOVED_MARKER
         );
-        assert!(
-            !messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("STRING_MCP_SENTINEL")
-        );
+        assert!(!messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("STRING_MCP_SENTINEL"));
         assert_eq!(
             messages[2]["content"][1]["image_url"]["url"],
             "data:image/png;base64,STRING_MCP_SENTINEL"
@@ -3872,7 +3864,7 @@ mod tests {
                 }
             ]
         })
-        .to_string();
+            .to_string();
         let result = convert_test_input(vec![
             json!({
                 "type": "custom_tool_call",
@@ -4019,7 +4011,7 @@ mod tests {
             {"type": "text", "text": long_text.clone()},
             {"type": "video", "data": residual_base64}
         ])
-        .to_string();
+            .to_string();
         let result = convert_test_input(vec![
             test_function_call("call_clamp"),
             test_function_output("call_clamp", json!(encoded_output)),
@@ -4028,12 +4020,10 @@ mod tests {
         let tool_content: Value = serde_json::from_str(tool_content_text).unwrap();
 
         assert_eq!(tool_content[1]["text"], long_text);
-        assert!(
-            tool_content[2]["data"]
-                .as_str()
-                .unwrap()
-                .starts_with("[cc-switch: omitted 20000 bytes]")
-        );
+        assert!(tool_content[2]["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("[cc-switch: omitted 20000 bytes]"));
         assert!(!tool_content_text.contains(&data_url));
         assert!(!tool_content_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }

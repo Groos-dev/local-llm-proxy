@@ -11,18 +11,18 @@
 //! - this module:               Responses request → Anthropic request, Anthropic response → Responses response
 
 use super::transform_codex_chat::{
-    CodexToolContext, build_codex_tool_context_from_request,
-    response_tool_call_item_from_chat_name, response_tool_call_item_id_from_chat_name,
+    build_codex_tool_context_from_request, response_tool_call_item_from_chat_name,
+    response_tool_call_item_id_from_chat_name, CodexToolContext,
 };
-use super::transform_responses::{TOOL_RESULT_ERROR_MARKER, sanitize_anthropic_tool_use_input};
+use super::transform_responses::{sanitize_anthropic_tool_use_input, TOOL_RESULT_ERROR_MARKER};
 use crate::proxy::error::ProxyError;
 use crate::proxy::json_canonical::canonical_json_string;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use crate::proxy::tool_media::{
-    TOOL_RESULT_MEDIA_ATTACHED_MARKER, ToolMediaScope, strip_and_clamp_media_from_tool_value,
+    strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde_json::{Value, json};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 
 pub(crate) const ANTHROPIC_THINKING_ENCRYPTED_PREFIX: &str = "ccswitch-anthropic-thinking-v1:";
@@ -71,15 +71,15 @@ fn reasoning_explicitly_disabled(effort: Option<&str>) -> bool {
 pub(crate) fn encode_anthropic_thinking_block(block: &Value) -> Option<String> {
     match block.get("type").and_then(|value| value.as_str()) {
         Some("thinking")
-            if block
-                .get("signature")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty()) => {}
+        if block
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()) => {}
         Some("redacted_thinking")
-            if block
-                .get("data")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty()) => {}
+        if block
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()) => {}
         _ => return None,
     }
     let bytes = serde_json::to_vec(block).ok()?;
@@ -129,9 +129,7 @@ pub(crate) fn map_anthropic_stop_reason_to_status(
         // pause_turn is unreachable on this path (Codex requests do not declare Anthropic server-side tools);
         // if it does occur, log a warning and treat it as completed.
         Some("pause_turn") => {
-            log::warn!(
-                "[Codex] Received unexpected Anthropic stop_reason=pause_turn, treating it as completed"
-            );
+            log::warn!("[Codex] Received unexpected Anthropic stop_reason=pause_turn, treating it as completed");
             ("completed", None)
         }
         _ => ("completed", None),
@@ -157,7 +155,7 @@ pub(crate) fn build_responses_usage_from_anthropic(usage: Option<&Value>) -> Val
                 "output_tokens": 0,
                 "total_tokens": 0,
                 "output_tokens_details": { "reasoning_tokens": 0 }
-            });
+            })
         }
     };
 
@@ -217,10 +215,10 @@ fn responses_system_text(item: &Value) -> Vec<String> {
                     part.get("type").and_then(Value::as_str),
                     Some("input_text" | "output_text" | "text")
                 )
-                .then(|| part.get("text").and_then(Value::as_str))
-                .flatten()
-                .filter(|text| is_meaningful_text(text))
-                .map(|text| text.trim().to_string())
+                    .then(|| part.get("text").and_then(Value::as_str))
+                    .flatten()
+                    .filter(|text| is_meaningful_text(text))
+                    .map(|text| text.trim().to_string())
             })
             .collect(),
         _ => Vec::new(),
@@ -318,9 +316,9 @@ pub fn responses_request_to_anthropic(
     let explicitly_disabled = reasoning_explicitly_disabled(reasoning_effort);
     let adaptive_should_think = adaptive_model
         && (adaptive_by_default
-            || reasoning_effort
-                .and_then(codex_effort_to_anthropic)
-                .is_some());
+        || reasoning_effort
+        .and_then(codex_effort_to_anthropic)
+        .is_some());
 
     if !thinking_history_is_valid {
         if cannot_disable_thinking {
@@ -880,19 +878,19 @@ fn append_sanitized_tool_result_value(
             }
         }
         Value::Object(object)
-            if matches!(
+        if matches!(
                 object.get("type").and_then(Value::as_str),
                 Some("input_text" | "output_text" | "text")
             ) =>
-        {
-            if let Some(text) = object.get("text").and_then(Value::as_str) {
-                if text == TOOL_RESULT_ERROR_MARKER {
-                    *is_error = true;
-                } else {
-                    content.push(json!({"type":"text","text":text}));
+            {
+                if let Some(text) = object.get("text").and_then(Value::as_str) {
+                    if text == TOOL_RESULT_ERROR_MARKER {
+                        *is_error = true;
+                    } else {
+                        content.push(json!({"type":"text","text":text}));
+                    }
                 }
             }
-        }
         other => content.push(json!({
             "type":"text",
             "text":canonical_json_string(other)
@@ -1208,8 +1206,8 @@ fn image_block_from_input_image(part: &Value) -> Option<Value> {
         .get(..7)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
         || url
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
     {
         Some(json!({
             "type": "image",
@@ -1403,7 +1401,7 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
                          stop_reason: &mut Option<String>,
                          delta_usage: &mut Option<Value>,
                          saw_message_stop: &mut bool|
-     -> Result<(), ProxyError> {
+                         -> Result<(), ProxyError> {
         let mut data = String::new();
         for line in block.lines() {
             if let Some(chunk) = strip_sse_field(line, "data") {
@@ -1595,9 +1593,9 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
             for (key, value) in delta_usage {
                 if value.as_u64() == Some(0)
                     && usage
-                        .get(&key)
-                        .and_then(Value::as_u64)
-                        .is_some_and(|existing| existing > 0)
+                    .get(&key)
+                    .and_then(Value::as_u64)
+                    .is_some_and(|existing| existing > 0)
                 {
                     continue;
                 }
@@ -2199,7 +2197,7 @@ mod tests {
             "thinking": "old reasoning",
             "signature": "sig_old"
         }))
-        .unwrap();
+            .unwrap();
         let input = json!({
             "model": "claude-sonnet-5",
             "max_output_tokens": 4096,
@@ -2603,14 +2601,12 @@ mod tests {
                 {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "/tmp/a"}}
             ]
         }))
-        .unwrap();
+            .unwrap();
         let reasoning = converted["output"][0].clone();
-        assert!(
-            reasoning["encrypted_content"]
-                .as_str()
-                .unwrap()
-                .starts_with(ANTHROPIC_THINKING_ENCRYPTED_PREFIX)
-        );
+        assert!(reasoning["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .starts_with(ANTHROPIC_THINKING_ENCRYPTED_PREFIX));
 
         let replay = responses_request_to_anthropic(
             json!({
@@ -2625,7 +2621,7 @@ mod tests {
             }),
             4096,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(replay["thinking"]["type"], "adaptive");
         assert_eq!(replay["messages"][1]["content"][0]["type"], "thinking");
         assert_eq!(replay["messages"][1]["content"][0]["signature"], "sig_123");
@@ -2637,7 +2633,7 @@ mod tests {
             "id": "msg_redacted",
             "content": [{"type": "redacted_thinking", "data": "opaque"}]
         }))
-        .unwrap();
+            .unwrap();
         assert_eq!(response["output"][0]["summary"], json!([]));
         assert!(response["output"][0]["encrypted_content"].is_string());
     }
@@ -2658,7 +2654,7 @@ mod tests {
             }),
             &context,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["name"], "read");
         assert_eq!(response["output"][0]["namespace"], "mcp_files");
@@ -2670,7 +2666,7 @@ mod tests {
             "type": "error",
             "error": {"type": "overloaded_error", "message": "busy"}
         }))
-        .unwrap_err();
+            .unwrap_err();
         assert!(error.to_string().contains("overloaded_error"));
     }
 
@@ -2681,7 +2677,7 @@ mod tests {
             "stop_reason": "model_context_window_exceeded",
             "content": [{"type": "text", "text": "partial"}]
         }))
-        .unwrap();
+            .unwrap();
         assert_eq!(response["status"], "incomplete");
         assert_eq!(
             response["incomplete_details"]["reason"],
@@ -2700,7 +2696,7 @@ mod tests {
             }),
             4096,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(response["tool_choice"]["type"], "auto");
         assert_eq!(response["tool_choice"]["disable_parallel_tool_use"], true);
     }
@@ -2717,7 +2713,7 @@ mod tests {
             }),
             4096,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(response["messages"][1]["content"][0]["text"], "prefix");
     }
 
@@ -2736,7 +2732,7 @@ mod tests {
             }),
             4096,
         )
-        .unwrap();
+            .unwrap();
         let content = &response["messages"][2]["content"][0]["content"];
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image");
@@ -2758,16 +2754,14 @@ mod tests {
             }),
             4096,
         )
-        .unwrap();
+            .unwrap();
         let content = &response["messages"][2]["content"][0]["content"];
 
         assert_eq!(content[0]["type"], "text");
-        assert!(
-            !content[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("MCP_ANTHROPIC_IMAGE_SENTINEL")
-        );
+        assert!(!content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("MCP_ANTHROPIC_IMAGE_SENTINEL"));
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["source"]["media_type"], "image/webp");
         assert_eq!(content[1]["source"]["data"], "MCP_ANTHROPIC_IMAGE_SENTINEL");
@@ -2788,7 +2782,7 @@ mod tests {
                 {"type": "video", "data": residual_base64}
             ]
         })
-        .to_string();
+            .to_string();
         let response = responses_request_to_anthropic(
             json!({
                 "model": "c",
@@ -2799,7 +2793,7 @@ mod tests {
             }),
             4096,
         )
-        .unwrap();
+            .unwrap();
         let content = response["messages"][2]["content"][0]["content"]
             .as_array()
             .unwrap();
@@ -2809,12 +2803,10 @@ mod tests {
             .expect("stringified tool image should become an Anthropic image block");
 
         assert_eq!(image["source"]["data"], "STRING_IMAGE_SENTINEL");
-        assert!(
-            content
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .all(|text| !text.contains("STRING_IMAGE_SENTINEL"))
-        );
+        assert!(content
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .all(|text| !text.contains("STRING_IMAGE_SENTINEL")));
         let serialized = response.to_string();
         assert!(serialized.contains("[cc-switch: omitted 20000 bytes]"));
         assert!(!serialized.contains(&"A".repeat(64)));
@@ -2837,7 +2829,7 @@ mod tests {
             }),
             4096,
         )
-        .unwrap();
+            .unwrap();
 
         let tool_result = &response["messages"][2]["content"][0];
         assert_eq!(tool_result["is_error"], true);
@@ -2848,12 +2840,10 @@ mod tests {
         assert_eq!(tool_result["content"][1]["type"], "document");
         assert_eq!(tool_result["content"][1]["source"]["type"], "url");
         assert_eq!(tool_result["content"][2]["type"], "text");
-        assert!(
-            tool_result["content"][2]["text"]
-                .as_str()
-                .unwrap()
-                .contains("future_part")
-        );
+        assert!(tool_result["content"][2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("future_part"));
     }
 
     // ==================== Request normalization: non-empty & first is user ====================
@@ -3030,10 +3020,10 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
         // A malformed upstream can send a non-object `content_block`; the index
         // assignment on the next delta would have panicked before the shape guard.
         let sse = concat!(
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"content\":[]}}\n\n",
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":[1]}\n\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
-            "data: {\"type\":\"message_stop\"}\n\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":[1]}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
         );
         let msg = anthropic_sse_to_message_value(sse)
             .expect("aggregation must not panic on a non-object content_block");
@@ -3057,8 +3047,8 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
         // A malformed upstream can send a scalar `message`; the later
         // `message["content"] = …` would have panicked before the shape guard.
         let sse = concat!(
-            "data: {\"type\":\"message_start\",\"message\":\"oops\"}\n\n",
-            "data: {\"type\":\"message_stop\"}\n\n",
+        "data: {\"type\":\"message_start\",\"message\":\"oops\"}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
         );
         assert!(anthropic_sse_to_message_value(sse).is_err());
     }

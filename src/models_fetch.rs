@@ -6,7 +6,7 @@ use serde_json::Value;
 /// List model ids from provider. Tries `/v1/models` (and bare `/models` if needed).
 pub async fn fetch_model_ids(provider: &StoredProvider) -> Result<Vec<String>, ConfigError> {
     let client = reqwest::Client::builder()
-        .user_agent("local-llm-proxy/llpx")
+        .user_agent("agent-proxy/cli")
         .build()
         .map_err(|e| ConfigError::new(e.to_string()))?;
 

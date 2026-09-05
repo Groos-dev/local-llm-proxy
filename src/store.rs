@@ -1,7 +1,9 @@
 //! Persistent JSON store for providers, active selection, and model mappings.
 
 use crate::config::{ApiFormat, AppConfig, ConfigError, Provider};
+use crate::provider::CodexChatReasoningConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -11,7 +13,7 @@ use std::{
 pub const STORE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LlpxStore {
+pub struct AgentProxyStore {
     #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default)]
@@ -36,6 +38,8 @@ fn default_codex_active() -> bool {
 pub struct StoredProvider {
     pub name: String,
     pub base_url: String,
+    #[serde(default)]
+    pub is_full_url: bool,
     pub api_key: String,
     #[serde(default)]
     pub api_format: ApiFormat,
@@ -44,9 +48,16 @@ pub struct StoredProvider {
     pub model_mappings: BTreeMap<String, String>,
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// Default upstream model used when request body omits `model` (cc-switch `settings_config.model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<Value>,
 }
 
-impl LlpxStore {
+impl AgentProxyStore {
     pub fn empty(active: impl Into<String>) -> Self {
         Self {
             version: STORE_VERSION,
@@ -90,10 +101,14 @@ impl LlpxStore {
                 .map(|p| StoredProvider {
                     name: p.name.clone(),
                     base_url: p.base_url.clone(),
+                    is_full_url: p.is_full_url,
                     api_key: p.api_key.clone(),
                     api_format: p.api_format.clone(),
                     model_mappings: identity_mapping(p.upstream_model.as_deref()),
                     max_output_tokens: p.max_output_tokens,
+                    upstream_model: p.upstream_model.clone(),
+                    codex_chat_reasoning: p.codex_chat_reasoning.clone(),
+                    model_catalog: p.model_catalog.clone(),
                 })
                 .collect(),
         }
@@ -192,9 +207,13 @@ impl From<StoredProvider> for Provider {
         Self {
             name: p.name,
             base_url: p.base_url.trim_end_matches('/').to_string(),
+            is_full_url: p.is_full_url,
             api_key: p.api_key,
             api_format: p.api_format,
             max_output_tokens: p.max_output_tokens,
+            upstream_model: p.upstream_model,
+            codex_chat_reasoning: p.codex_chat_reasoning,
+            model_catalog: p.model_catalog,
             model_mappings: p.model_mappings.into_iter().collect(),
         }
     }
@@ -211,14 +230,14 @@ impl StoredProvider {
     }
 }
 
-/// Resolve store path: `LLPX_STORE` → `~/.llpx/store.json`.
+/// Resolve store path: `AGENT_PROXY_STORE` → `~/.agent-proxy/store.json`.
 pub fn default_store_path() -> PathBuf {
-    if let Some(p) = env::var_os("LLPX_STORE") {
+    if let Some(p) = env::var_os("AGENT_PROXY_STORE") {
         return PathBuf::from(p);
     }
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".llpx")
+        .join(".agent-proxy")
         .join("store.json")
 }
 
@@ -232,13 +251,13 @@ fn home_dir() -> Option<PathBuf> {
 pub fn load_runtime(
     store_path: &Path,
     toml_path: Option<&Path>,
-) -> Result<(LlpxStore, PathBuf), ConfigError> {
+) -> Result<(AgentProxyStore, PathBuf), ConfigError> {
     if store_path.exists() {
-        return Ok((LlpxStore::load(store_path)?, store_path.to_path_buf()));
+        return Ok((AgentProxyStore::load(store_path)?, store_path.to_path_buf()));
     }
     if let Some(toml) = toml_path.filter(|p| p.exists()) {
         let cfg = AppConfig::load(toml)?;
-        let store = LlpxStore::from_app_config(&cfg);
+        let store = AgentProxyStore::from_app_config(&cfg);
         store.save(store_path)?;
         return Ok((store, store_path.to_path_buf()));
     }
@@ -258,7 +277,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("llpx-store-{n}"));
+        let dir = env::temp_dir().join(format!("agent-proxy-store-{n}"));
         fs::create_dir_all(&dir).unwrap();
         dir.join("store.json")
     }
@@ -266,17 +285,21 @@ mod tests {
     #[test]
     fn round_trip_store_json() {
         let path = tmp();
-        let mut store = LlpxStore::empty("a");
+        let mut store = AgentProxyStore::empty("a");
         store.upsert_provider(StoredProvider {
             name: "a".into(),
             base_url: "https://example.com/v1".into(),
+            is_full_url: false,
             api_key: "k".into(),
             api_format: ApiFormat::OpenaiResponses,
             model_mappings: BTreeMap::from([("m1".into(), "m1".into())]),
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
         });
         store.save(&path).unwrap();
-        let loaded = LlpxStore::load(&path).unwrap();
+        let loaded = AgentProxyStore::load(&path).unwrap();
         assert_eq!(loaded.active_provider, "a");
         assert!(loaded.codex_active);
         assert_eq!(loaded.providers[0].model_mappings["m1"], "m1");
@@ -296,7 +319,7 @@ mod tests {
                 "model_mappings": { "client": "upstream" }
             }]
         }"#;
-        let store: LlpxStore = serde_json::from_str(value).unwrap();
+        let store: AgentProxyStore = serde_json::from_str(value).unwrap();
         assert_eq!(store.providers[0].model_mappings["client"], "upstream");
         let json = serde_json::to_value(&store.providers[0]).unwrap();
         assert!(json.get("default_upstream_model").is_none());
@@ -309,7 +332,7 @@ mod tests {
             "active_provider": "a",
             "providers": []
         }"#;
-        let store: LlpxStore = serde_json::from_str(value).unwrap();
+        let store: AgentProxyStore = serde_json::from_str(value).unwrap();
         assert!(store.codex_active);
     }
 
@@ -318,10 +341,14 @@ mod tests {
         let mut p = StoredProvider {
             name: "a".into(),
             base_url: "https://x".into(),
+            is_full_url: false,
             api_key: "k".into(),
             api_format: ApiFormat::OpenaiChat,
             model_mappings: BTreeMap::from([("client".into(), "upstream".into())]),
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
         };
         p.apply_identity_mappings_from_models(&["a".into(), "b".into()]);
         assert_eq!(p.model_mappings["client"], "upstream");
@@ -331,14 +358,18 @@ mod tests {
 
     #[test]
     fn rename_provider_rejects_existing_name() {
-        let mut store = LlpxStore::empty("a");
+        let mut store = AgentProxyStore::empty("a");
         let provider = |name: &str| StoredProvider {
             name: name.into(),
             base_url: "https://example.com/v1".into(),
+            is_full_url: false,
             api_key: "key".into(),
             api_format: ApiFormat::OpenaiResponses,
             model_mappings: BTreeMap::from([(String::from("model"), String::from("model"))]),
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
         };
         store.upsert_provider(provider("a"));
         store.upsert_provider(provider("b"));

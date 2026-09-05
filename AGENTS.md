@@ -2,11 +2,20 @@
 
 ## Project Structure & Module Organization
 
-This repository is a Rust 2024 Codex-oriented local LLM proxy. It takes over Codex `base_url` + `auth.json` while running, forwards `/v1/responses` (+ compact), and bridges three upstream API formats back to the OpenAI Responses shape Codex expects. Entry point and routes are in `src/main.rs`; library surface is `src/lib.rs`.
+This repository is a Rust 2024 Codex-oriented local LLM proxy. It takes over Codex `base_url` + `auth.json` while running, forwards `/v1/responses` (+ compact), and bridges three upstream API formats back to the OpenAI Responses shape Codex expects. Entry point is `src/main.rs` (bootstrap only); library surface is `src/lib.rs`.
+
+Codex Responses call chain (aligned with cc-switch naming):
+
+`proxy/server` → `handlers::handle_responses` → `handler_context::RequestContext` → `forwarder::forward_with_retry` → `response_processor::process_response` (or chat/anthropic bridges).
 
 - `src/config.rs`: TOML config (`active_provider`, `[[providers]]` with `api_format` / `upstream_model`).
 - `src/codex_live.rs`: apply/restore of Codex `base_url`, forced `wire_api = "responses"`, and `OPENAI_API_KEY` placeholder.
-- `src/proxy/`: protocol bridges ported from cc-switch (Responses / Chat Completions / Anthropic Messages, SSE rewriting).
+- `src/proxy/server.rs`: `ProxyState`, router (`/v1/responses`, compact, admin).
+- `src/proxy/handlers.rs`: Codex Responses / compact entry.
+- `src/proxy/handler_context.rs`: `RequestContext`, streaming timeouts.
+- `src/proxy/forwarder.rs`: single-provider forward (responses passthrough, chat/anthropic bridges, xAI scrub hooks).
+- `src/proxy/response_processor.rs`: SSE/JSON byte passthrough (no usage DB).
+- `src/proxy/providers/`: protocol bridges and Codex helpers (`codex.rs`, `transform_codex_*`, `streaming_codex_*`, xAI namespace/sanitize).
 - `src/exchange.rs`: request/response exchange logging under `.run/`.
 - `config.toml`: local credentials (gitignored; copy from `config.example.toml`).
 
@@ -23,13 +32,13 @@ Compact is always accepted on the local entry (same as cc-switch) and follows th
 Hot-switch without restarting Codex:
 
 ```bash
-./llpx providers
-./llpx use mmkg-chat
+./agent-proxy providers
+./agent-proxy use mmkg-chat
 ```
 
 or `POST /v1/admin/active` with `{"name":"..."}` (also persists the active provider in the JSON store).
 
-Runtime files belong under `.run/` (gitignored). `./llpx` opens the hierarchical TUI; its Codex `ACTIVE` state controls whether `./llpx start` applies live takeover (`base_url` + `wire_api=responses` + auth placeholder). `INACTIVE` leaves the Codex files untouched even while the proxy runs. `./llpx stop` restores an existing takeover. Set `LLPX_SKIP_CODEX_LIVE=1` to skip takeover.
+Runtime files belong under `.run/` (gitignored). `./agent-proxy` opens the hierarchical TUI; its Codex `ACTIVE` state controls whether `./agent-proxy start` applies live takeover (`base_url` + `wire_api=responses` + auth placeholder). `INACTIVE` leaves the Codex files untouched even while the proxy runs. `./agent-proxy stop` restores an existing takeover. Set `AGENT_PROXY_SKIP_CODEX_LIVE=1` to skip takeover.
 
 ## Build, Test, and Development Commands
 
@@ -38,11 +47,11 @@ cargo build                 # Build the debug proxy binary
 cargo test                  # Run unit tests
 cargo fmt --check           # Verify Rust formatting
 cargo clippy --all-targets  # Run Rust lints
-./llpx start                # Build, apply Codex live config, listen on 127.0.0.1:8787
-./llpx stop                 # Restore Codex config and stop the proxy
-./llpx status               # Show proxy health / active provider
-./llpx providers            # List configured providers
-./llpx use <name>           # Hot-switch active upstream provider
+./agent-proxy start                # Build, apply Codex live config, listen on 127.0.0.1:8787
+./agent-proxy stop                 # Restore Codex config and stop the proxy
+./agent-proxy status               # Show proxy health / active provider
+./agent-proxy providers            # List configured providers
+./agent-proxy use <name>           # Hot-switch active upstream provider
 ```
 
 Load `CONFIG_PATH` (default `config.toml`). Optional `BIND_ADDR` / `EXCHANGE_LOG_DIR` override TOML. Some upstreams (e.g. Cloudflare) require a Codex-like `User-Agent`; the proxy sets a default when missing.

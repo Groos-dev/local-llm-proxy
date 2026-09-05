@@ -1,6 +1,14 @@
+pub(crate) mod content_encoding;
+pub mod cache_injector;
 pub mod error;
+pub mod forwarder;
+pub mod handler_context;
+pub mod handlers;
+pub mod http_util;
 pub mod json_canonical;
 pub mod providers;
+pub mod response_processor;
+pub mod server;
 pub mod sse;
 pub mod thinking_optimizer;
 pub mod tool_media;

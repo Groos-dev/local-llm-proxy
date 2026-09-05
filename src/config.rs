@@ -1,4 +1,6 @@
+use crate::provider::CodexChatReasoningConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::HashSet,
     error::Error,
@@ -63,6 +65,8 @@ impl Default for ApiFormat {
 pub struct ProviderConfig {
     pub name: String,
     pub base_url: String,
+    #[serde(default)]
+    pub is_full_url: bool,
     pub api_key: String,
     #[serde(default)]
     pub api_format: ApiFormat,
@@ -73,15 +77,28 @@ pub struct ProviderConfig {
     /// Anthropic conversion (mirrors cc-switch provider meta).
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// Explicit Responses→Chat reasoning wire shape (cc-switch `meta.codex_chat_reasoning`).
+    #[serde(default)]
+    pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    /// Optional model catalog (cc-switch `settings_config.modelCatalog`) for Zen effort levels.
+    #[serde(default)]
+    pub model_catalog: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Provider {
     pub name: String,
     pub base_url: String,
+    pub is_full_url: bool,
     pub api_key: String,
     pub api_format: ApiFormat,
     pub max_output_tokens: Option<u64>,
+    /// Default upstream model (cc-switch `settings_config.model`) for reasoning infer fallback.
+    pub upstream_model: Option<String>,
+    /// Explicit Responses→Chat reasoning wire shape (cc-switch `meta.codex_chat_reasoning`).
+    pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    /// Optional model catalog for Zen per-model `reasoningLevels`.
+    pub model_catalog: Option<Value>,
     /// Codex/client model id → upstream model id.
     pub model_mappings: std::collections::HashMap<String, String>,
 }
@@ -192,9 +209,13 @@ impl From<ProviderConfig> for Provider {
         Self {
             name: cfg.name,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            is_full_url: cfg.is_full_url,
             api_key: cfg.api_key,
             api_format: cfg.api_format,
             max_output_tokens: cfg.max_output_tokens,
+            upstream_model: cfg.upstream_model.clone(),
+            codex_chat_reasoning: cfg.codex_chat_reasoning,
+            model_catalog: cfg.model_catalog,
             model_mappings,
         }
     }
@@ -245,6 +266,24 @@ upstream_model = "claude-sonnet"
                 .map(String::as_str),
             Some("claude-sonnet")
         );
+        assert!(!providers[0].is_full_url);
+    }
+
+    #[test]
+    fn parses_explicit_full_url_provider_flag() {
+        let cfg = AppConfig::from_toml(
+            r#"
+active_provider = "a"
+[[providers]]
+name = "a"
+base_url = "https://relay.example/generate"
+api_key = "k"
+is_full_url = true
+"#,
+        )
+        .unwrap();
+        let (_, providers) = cfg.into_providers().unwrap();
+        assert!(providers[0].is_full_url);
     }
 
     #[test]
@@ -252,9 +291,13 @@ upstream_model = "claude-sonnet"
         let provider = Provider {
             name: "a".into(),
             base_url: "https://example.com/v1".into(),
+            is_full_url: false,
             api_key: "k".into(),
             api_format: ApiFormat::OpenaiResponses,
             max_output_tokens: None,
+            upstream_model: None,
+            codex_chat_reasoning: None,
+            model_catalog: None,
             model_mappings: std::collections::HashMap::from([("client".into(), "upstream".into())]),
         };
         assert_eq!(
